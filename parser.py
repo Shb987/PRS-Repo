@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 class InvoiceParser:
     """
@@ -48,12 +48,26 @@ class InvoiceParser:
         """
         Execute parsing logic on raw text and tables based on mode ('admin' or 'retailer').
         """
+        taxable_amt = InvoiceParser._extract_taxable_amount(text)
+        net_amt = InvoiceParser._extract_net_amount(text)
+        inv_no = InvoiceParser._extract_invoice_number(text)
+        inv_date = InvoiceParser._extract_date(text)
+        gstin = InvoiceParser._extract_gstin(text)
+        dl = InvoiceParser._extract_dl(text)
+
         data = {
             "invoice_metadata": {
-                "invoice_number": InvoiceParser._extract_invoice_number(text),
-                "date": InvoiceParser._extract_date(text),
+                "invoice_number": inv_no,
+                "invoice_no": inv_no,
+                "date": inv_date,
+                "invoice_date": inv_date,
                 "total_amount": InvoiceParser._extract_total_amount(text, mode),
-                "gstin": InvoiceParser._extract_gstin(text),
+                "taxable_amount": taxable_amt,
+                "net_amount": net_amt,
+                "gstin": gstin,
+                "extracted_gstin": gstin,
+                "dl": dl,
+                "extracted_dl": dl,
                 "currency": InvoiceParser._extract_currency(text)
             },
             "line_items": []
@@ -272,6 +286,55 @@ class InvoiceParser:
         pattern = r"\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}\b"
         match = re.search(pattern, text)
         return match.group(0) if match else "Not Found"
+
+    @staticmethod
+    def _extract_dl(text: str) -> Optional[str]:
+        # Drug License pattern e.g., D.L. No.: KL-TVM-123456 or 20B/21B: 123456
+        patterns = [
+            r"(?:D\.?\s*L\.?\s*(?:No|Number)?|Drug\s*Lic(?:ense)?\s*(?:No|Number)?|Licence\s*No)[:\.\s]+([A-Z0-9\-\/,\s]+?)(?=\s*(?:GSTIN|PAN|State|Phone|Mob|Email|\n|$))",
+            r"\b([A-Z]{2}-[A-Z]{2,4}-\d{5,8})\b",
+            r"\b(KL-[A-Z0-9\-]+)\b"
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                val = match.group(1).strip()
+                if len(val) >= 4 and not val.lower().startswith("gst"):
+                    return val
+        return None
+
+    @staticmethod
+    def _extract_taxable_amount(text: str) -> Optional[float]:
+        patterns = [
+            r"(?:Taxable\s*(?:Amt|Amount|Value)|Total\s*Taxable)\s*[:\s]*([\$£€₹]?\s*[\d,]+\.?\d*)",
+            r"(?:Sub\s*Total|Taxable)\s*[:\s]*([\$£€₹]?\s*[\d,]+\.?\d*)"
+        ]
+        for pattern in patterns:
+            matches = list(re.finditer(pattern, text, re.IGNORECASE))
+            if matches:
+                val_str = matches[-1].group(1).strip()
+                cleaned = re.sub(r'[^\d.]', '', val_str)
+                try:
+                    return float(cleaned)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _extract_net_amount(text: str) -> Optional[float]:
+        patterns = [
+            r"(?:Net\s*Payable|Net\s*Amount|Total\s*Payable|Grand\s*Total|Invoice\s*Total|Total\s*Amount)\s*[:\s]*([\$£€₹]?\s*[\d,]+\.?\d*)"
+        ]
+        for pattern in patterns:
+            matches = list(re.finditer(pattern, text, re.IGNORECASE))
+            if matches:
+                val_str = matches[-1].group(1).strip()
+                cleaned = re.sub(r'[^\d.]', '', val_str)
+                try:
+                    return float(cleaned)
+                except ValueError:
+                    continue
+        return None
 
     @staticmethod
     def _extract_currency(text: str) -> str:
