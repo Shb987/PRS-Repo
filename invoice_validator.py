@@ -224,6 +224,7 @@ Return ONLY valid JSON matching this schema:
   "match_status": "matched" | "partial_match" | "mismatched",
   "summary": "string",
   "data": {{
+    "match_status": "matched" | "partial_match" | "mismatched",
     "invoice_metadata": {{
       "invoice_no": "string",
       "invoice_date": "string (YYYY-MM-DD)",
@@ -238,6 +239,7 @@ Return ONLY valid JSON matching this schema:
         "product_id": int | string,
         "product_name": "string",
         "size": "string or null",
+        "match_status": "matched" | "partial_match",
         "ordered_qty": number,
         "invoiced_qty": number,
         "free_qty": number,
@@ -249,7 +251,8 @@ Return ONLY valid JSON matching this schema:
             "batch_no": "string",
             "quantity": number,
             "free_quantity": number,
-            "expiry_date": "string (YYYY-MM-DD) or null"
+            "expiry_date": "string (YYYY-MM-DD) or null",
+            "match_status": "matched"
           }}
         ]
       }}
@@ -260,6 +263,7 @@ Return ONLY valid JSON matching this schema:
         "product_id": int | string,
         "product_name": "string",
         "size": "string or null",
+        "match_status": "missing",
         "ordered_qty": number,
         "reason": "string"
       }}
@@ -268,6 +272,7 @@ Return ONLY valid JSON matching this schema:
       {{
         "product_name": "string",
         "batch_no": "string",
+        "match_status": "extra",
         "quantity": number,
         "free_qty": number,
         "expiry_date": "string (YYYY-MM-DD) or null",
@@ -372,11 +377,13 @@ Return ONLY valid JSON matching this schema:
                     item_net += amt
 
             if matched_batches:
+                item_status = "matched" if total_invoiced_qty >= ordered_qty else "partial_match"
                 reconciled_items.append({
                     "order_item_id": ord_item_id,
                     "product_id": prod_id,
                     "product_name": prod_name,
                     "size": size,
+                    "match_status": item_status,
                     "ordered_qty": int(ordered_qty) if ordered_qty.is_integer() else ordered_qty,
                     "invoiced_qty": int(total_invoiced_qty) if total_invoiced_qty.is_integer() else total_invoiced_qty,
                     "free_qty": int(total_free_qty) if total_free_qty.is_integer() else total_free_qty,
@@ -391,6 +398,7 @@ Return ONLY valid JSON matching this schema:
                     "product_id": prod_id,
                     "product_name": prod_name,
                     "size": size,
+                    "match_status": "missing",
                     "ordered_qty": int(ordered_qty) if ordered_qty.is_integer() else ordered_qty,
                     "reason": f"Product {prod_name} was not found on the invoice."
                 })
@@ -406,6 +414,7 @@ Return ONLY valid JSON matching this schema:
                 extra_items.append({
                     "product_name": inv_item.get("description") or inv_item.get("item_name") or "Unknown Product",
                     "batch_no": inv_item.get("batch") or inv_item.get("batch_no") or "N/A",
+                    "match_status": "extra",
                     "quantity": int(qty) if qty.is_integer() else qty,
                     "free_qty": int(free_q) if free_q.is_integer() else free_q,
                     "expiry_date": self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp")),
@@ -458,6 +467,7 @@ Return ONLY valid JSON matching this schema:
             "match_status": match_status,
             "summary": summary,
             "data": {
+                "match_status": match_status,
                 "invoice_metadata": invoice_metadata,
                 "reconciled_items": reconciled_items,
                 "missing_items": missing_items,
@@ -516,7 +526,14 @@ Return ONLY valid JSON matching this schema:
             if oid is not None:
                 reconciled_pids.add(str(oid))
 
+            ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
+            inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
+            if not item.get("match_status") or str(item.get("match_status")).lower() in ["none", "null"]:
+                item["match_status"] = "matched" if inv_q >= ord_q else "partial_match"
+
             for b in item.get("batches", []):
+                if not b.get("match_status") or str(b.get("match_status")).lower() in ["none", "null"]:
+                    b["match_status"] = "matched"
                 exp_val = b.get("expiry_date")
                 b_no = (b.get("batch_no") or "").strip().upper()
                 if not exp_val or str(exp_val).upper() in ["N/A", "NONE", "NULL", "BLANK", ""]:
@@ -530,6 +547,8 @@ Return ONLY valid JSON matching this schema:
                 b["expiry_date"] = self._format_expiry_iso(exp_val)
 
         for it in extra_items:
+            if not it.get("match_status") or str(it.get("match_status")).lower() in ["none", "null"]:
+                it["match_status"] = "extra"
             exp_val = it.get("expiry_date")
             b_no = (it.get("batch_no") or "").strip().upper()
             if not exp_val or str(exp_val).upper() in ["N/A", "NONE", "NULL", "BLANK", ""]:
@@ -549,6 +568,8 @@ Return ONLY valid JSON matching this schema:
             m_oid = str(m.get("order_item_id", ""))
             if (m_pid and m_pid in reconciled_pids) or (m_oid and m_oid in reconciled_pids):
                 continue
+            if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
+                m["match_status"] = "missing"
             clean_missing.append(m)
         missing_items = clean_missing
 
@@ -574,11 +595,15 @@ Return ONLY valid JSON matching this schema:
             match_status = "partial_match"
             summary = "Verification Mismatch: Quantities differ from ordered. Please verify before approving."
 
+        if not match_status or str(match_status).lower() in ["none", "null"]:
+            match_status = "matched" if (len(reconciled_items) > 0 and len(missing_items) == 0 and len(extra_items) == 0) else "partial_match"
+
         return {
             "success": True,
             "match_status": match_status,
             "summary": summary,
             "data": {
+                "match_status": match_status,
                 "invoice_metadata": clean_meta,
                 "reconciled_items": reconciled_items,
                 "missing_items": missing_items,

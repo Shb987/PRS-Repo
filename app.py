@@ -193,9 +193,14 @@ def process_extraction(mode):
             # 2. Parse Specific Contents
             extracted_data = InvoiceParser.parse(raw_text, tables, mode=mode)
             
-            # If order_data is passed, include validation in the output
-            order_data = request.form.get('order_data') or request.form.get('order')
-            if order_data:
+            # If order_data or order_details is passed, include validation in the output
+            order_raw = request.form.get('order_details') or request.form.get('order_data') or request.form.get('order')
+            if order_raw:
+                try:
+                    order_data = json.loads(order_raw)
+                except Exception:
+                    order_data = order_raw
+
                 validation = invoice_validator.validate(
                     invoice_text=raw_text,
                     invoice_tables=tables,
@@ -203,6 +208,12 @@ def process_extraction(mode):
                     parsed_invoice=extracted_data
                 )
                 extracted_data["validation"] = validation
+                extracted_data["match_status"] = validation.get("match_status", "matched")
+                extracted_data["summary"] = validation.get("summary", "")
+                if "data" in validation:
+                    extracted_data["data"] = validation["data"]
+            else:
+                extracted_data["match_status"] = "unverified"
 
             # 3. Return full data (metadata + line items)
             return jsonify(extracted_data)
