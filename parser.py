@@ -16,12 +16,17 @@ class InvoiceParser:
         "hsn": ["hsn", "hsn code", "hsn/sac", "commodity code", "hsn/ sac"],
         "batch": [
             "batch", "batch no", "batch number", "b.no", "lot no", "lot", "batchno",
-            "b no", "b. no", "lot.no", "b.num", "batch/lot", "batch/exp", "b.no / exp", "batch / exp"
+            "b no", "b. no", "lot.no", "b.num", "batch/lot", "batch/exp", "b.no / exp",
+            "batch / exp", "b.no/exp", "lot/exp", "batch/expiry", "batch / expiry"
         ],
         "expiry": [
             "exp", "expiry", "exp date", "expiry date", "exp.", "e.date", "expdt", 
-            "exp.date", "valid till", "exp dt", "exp.dt", "e.dt", "edate", "edt",
-            "validity", "valid upto", "val till", "use before", "ubd", "batch/exp", "b.no / exp", "batch / exp"
+            "exp.date", "valid till", "exp dt", "exp. dt", "exp.dt", "expdt.", "e.dt",
+            "edt", "edate", "validity", "valid upto", "val till", "use before", "ubd",
+            "best before", "shelf life", "exp mth", "exp.mth", "exp month", "exp.month",
+            "exp mon", "exp.mon", "exp yr", "exp.yr", "exp year", "expiry dt", "expiry dt.",
+            "exp/dt", "exp/mth", "batch/exp", "b.no/exp", "b.no / exp", "batch / exp",
+            "exp/batch", "batch/expiry", "batch / expiry", "mfg/exp", "exp/mfg"
         ],
         "p_code": ["p.code", "p code", "product code", "item code", "code"],
         "qty": ["qty", "quantity", "qnty", "units"],
@@ -83,19 +88,50 @@ class InvoiceParser:
         return data
 
     @staticmethod
-    def _parse_and_verify_expiry(val: str) -> Optional[str]:
+    def _parse_and_verify_expiry(val: Any) -> Optional[str]:
         """
         Validates that val contains a plausible expiry date and normalizes it to MM/YY.
         Rejects non-dates such as tax rates, price amounts, HSN codes, or invalid months/years.
+        Supports:
+        - MM/YY, M/YY, MM-YY, MM.YY, MM / YY (e.g. 04/28, 4/28, 10/26)
+        - YY/MM, YY-MM, YY.MM (e.g. 28/04, 28-04)
+        - MM/YYYY, MM-YYYY, MM.YYYY (e.g. 04/2028, 10/2026)
+        - YYYY/MM, YYYY-MM, YYYY.MM (e.g. 2028/04, 2026-10)
+        - Full dates: DD/MM/YYYY, DD-MM-YYYY, DD/MM/YY, DD-MM-YY (e.g. 30/04/2028, 15/04/28, 01/10/26)
+        - ISO dates: YYYY-MM-DD, YYYY/MM/DD (e.g. 2028-04-30)
+        - Named months: APR/28, APR-28, APR 2028, APR.28, OCT/26, 28-APR, 2026-OCT
+        - Contiguous digits: MMYY, MM20YY, 20YYMM (e.g. 0428, 1026, 042028)
+        - Dual dates (MFG & EXP): e.g. "MFG: 05/24 EXP: 05/27" or "05/24 05/27"
+        - Prefixed strings: EXP: 04/28, EXP. 10/26, E: 04/28
         """
-        if not val or not str(val).strip():
+        if val is None:
+            return None
+        val_str = str(val).strip()
+        if not val_str:
             return None
 
-        cleaned = str(val).strip()
-        cleaned_upper = cleaned.upper()
-
-        if cleaned_upper in ["N/A", "NA", "NONE", "NIL", "-", "--", "NULL", "BLANK"]:
+        cleaned_upper = val_str.upper()
+        if cleaned_upper in ["N/A", "NA", "NONE", "NIL", "-", "--", "NULL", "BLANK", "EMPTY"]:
             return None
+
+        # Reject obvious non-dates (pure prices, tax percentages, HSN codes)
+        if re.fullmatch(r'[\$£€₹]?\s*\d+[\.,]\d{2}%?', cleaned_upper):
+            m_dot = re.fullmatch(r'(\d{1,2})\.(\d{2})', cleaned_upper)
+            if m_dot:
+                m_val, y_val = int(m_dot.group(1)), int(m_dot.group(2))
+                if not (1 <= m_val <= 12 and 20 <= y_val <= 60):
+                    return None
+            else:
+                return None
+
+        # Check for labeled expiry pattern first (e.g. EXP: 05/27, EXPIRY 10/26, E: 05/27, EDT: 04/28)
+        exp_labeled = re.search(r'\b(?:EXP(?:IRY)?|EDT|UBD|EXP\.?)\b[:\.\s]*([A-Z0-9\./\-]+)|\bE[:\.][\s]*([A-Z0-9\./\-]+)', cleaned_upper)
+        if exp_labeled:
+            date_part = exp_labeled.group(1) or exp_labeled.group(2)
+            if date_part:
+                sub_res = InvoiceParser._parse_and_verify_expiry(date_part)
+                if sub_res:
+                    return sub_res
 
         month_names = {
             "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
@@ -103,72 +139,78 @@ class InvoiceParser:
         }
         m_regex = r"(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
 
+        candidates = []
+
         # 1. Named Month with Year: e.g. APR/28, APR-28, APR 2028, APR.28, OCT/26
-        m = re.search(r'\b' + m_regex + r'[\./\s-]+(?:20)?(\d{2})\b', cleaned_upper)
-        if m:
+        for m in re.finditer(r'\b' + m_regex + r'[\./\s-]+(?:20)?(\d{2})\b', cleaned_upper):
             m_str = m.group(1)[:3]
             if m_str in month_names:
-                month = month_names[m_str]
-                yy = int(m.group(2))
-                return f"{month:02d}/{yy:02d}"
+                candidates.append((int(m.group(2)), month_names[m_str]))
 
         # 2. Year with Named Month: e.g. 28-APR, 2028-APR, 28/APR, 26-OCT
-        m = re.search(r'\b(?:20)?(\d{2})[\./\s-]+' + m_regex + r'\b', cleaned_upper)
-        if m:
+        for m in re.finditer(r'\b(?:20)?(\d{2})[\./\s-]+' + m_regex + r'\b', cleaned_upper):
             m_str = m.group(2)[:3]
             if m_str in month_names:
-                month = month_names[m_str]
-                yy = int(m.group(1))
-                return f"{month:02d}/{yy:02d}"
+                candidates.append((int(m.group(1)), month_names[m_str]))
 
         # 3. ISO format: YYYY-MM-DD or YYYY/MM/DD
-        m = re.search(r'\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b', cleaned_upper)
-        if m:
+        for m in re.finditer(r'\b(20\d{2})\s*[-/]\s*(\d{1,2})\s*[-/]\s*(\d{1,2})\b', cleaned_upper):
             yy = int(m.group(1)) % 100
             month = int(m.group(2))
-            if 1 <= month <= 12:
-                return f"{month:02d}/{yy:02d}"
+            if 1 <= month <= 12 and 20 <= yy <= 60:
+                candidates.append((yy, month))
 
-        # 4. Full date: DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
-        m = re.search(r'\b(\d{1,2})[\./-](\d{1,2})[\./-](20\d{2})\b', cleaned_upper)
-        if m:
-            d, month, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            yy = yyyy % 100
-            if 1 <= month <= 12 and 1 <= d <= 31:
-                return f"{month:02d}/{yy:02d}"
-
-        # 5. MM/YYYY or MM-YYYY or MM.YYYY (4-digit year)
-        m = re.search(r'\b(\d{1,2})[\./\s-]+(20\d{2})\b', cleaned_upper)
-        if m:
-            month = int(m.group(1))
-            yy = int(m.group(2)) % 100
-            if 1 <= month <= 12 and 20 <= yy <= 45:
-                return f"{month:02d}/{yy:02d}"
-
-        # 6. YYYY/MM or YYYY-MM (4-digit year first)
-        m = re.search(r'\b(20\d{2})[\./\s-]+(\d{1,2})\b', cleaned_upper)
-        if m:
-            yy = int(m.group(1)) % 100
-            month = int(m.group(2))
-            if 1 <= month <= 12 and 20 <= yy <= 45:
-                return f"{month:02d}/{yy:02d}"
-
-        # 7. MM/YY or MM-YY or MM.YY or MM / YY (2-digit year)
-        m = re.search(r'\b(\d{1,2})\s*[\./-]\s*(\d{2})\b', cleaned_upper)
-        if m:
+        # 4. Full date with 4-digit or 2-digit year: DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY or DD-MM-YY
+        for m in re.finditer(r'\b(\d{1,2})\s*[\./-]\s*(\d{1,2})\s*[\./-]\s*((?:20)?\d{2})\b', cleaned_upper):
             p1 = int(m.group(1))
             p2 = int(m.group(2))
-            if 1 <= p1 <= 12 and 20 <= p2 <= 45:
-                return f"{p1:02d}/{p2:02d}"
-            elif 20 <= p1 <= 45 and 1 <= p2 <= 12:
-                return f"{p2:02d}/{p1:02d}"
+            yy = int(m.group(3)[-2:])
+            if 1 <= p2 <= 12 and 1 <= p1 <= 31 and 20 <= yy <= 60:
+                candidates.append((yy, p2))
+            elif 1 <= p1 <= 12 and 1 <= p2 <= 31 and 20 <= yy <= 60:
+                candidates.append((yy, p1))
 
-        # 8. Contiguous 4 digits: MMYY (e.g. 0527)
-        m = re.search(r'\b(\d{2})(\d{2})\b', cleaned_upper)
+        # 5. MM/YYYY or MM-YYYY or MM.YYYY (4-digit year)
+        for m in re.finditer(r'\b(\d{1,2})\s*[\./\s-]+\s*(20\d{2})\b', cleaned_upper):
+            month = int(m.group(1))
+            yy = int(m.group(2)) % 100
+            if 1 <= month <= 12 and 20 <= yy <= 60:
+                candidates.append((yy, month))
+
+        # 6. YYYY/MM or YYYY-MM (4-digit year first)
+        for m in re.finditer(r'\b(20\d{2})\s*[\./\s-]+\s*(\d{1,2})\b', cleaned_upper):
+            yy = int(m.group(1)) % 100
+            month = int(m.group(2))
+            if 1 <= month <= 12 and 20 <= yy <= 60:
+                candidates.append((yy, month))
+
+        # 7. MM/YY or MM-YY or MM.YY or MM / YY (2-digit year)
+        for m in re.finditer(r'\b(\d{1,2})\s*[\./-]\s*(\d{2})\b', cleaned_upper):
+            p1 = int(m.group(1))
+            p2 = int(m.group(2))
+            if 1 <= p1 <= 12 and 20 <= p2 <= 60:
+                candidates.append((p2, p1))
+            elif 20 <= p1 <= 60 and 1 <= p2 <= 12:
+                candidates.append((p1, p2))
+
+        # If date candidates found, pick the latest date (expiry is always after manufacture)
+        if candidates:
+            best_y, best_m = max(candidates, key=lambda x: (x[0], x[1]))
+            return f"{best_m:02d}/{best_y:02d}"
+
+        # 8. Contiguous 4 digits: MMYY (e.g. 0428, 1026) - require MM (01-12) and plausible future year (25-45)
+        # Avoids matching HSN codes like 3004
+        m = re.search(r'\b(0[1-9]|1[0-2])([2-4]\d)\b', cleaned_upper)
         if m:
-            p1, p2 = int(m.group(1)), int(m.group(2))
-            if 1 <= p1 <= 12 and 24 <= p2 <= 40:
-                return f"{p1:02d}/{p2:02d}"
+            mo, yr = int(m.group(1)), int(m.group(2))
+            return f"{mo:02d}/{yr:02d}"
+
+        # 9. Contiguous 6 digits: MM20YY (e.g. 042028)
+        m = re.search(r'\b(0[1-9]|1[0-2])(20[2-4]\d)\b', cleaned_upper)
+        if m:
+            mo = int(m.group(1))
+            yy = int(m.group(2)[-2:])
+            return f"{mo:02d}/{yy:02d}"
 
         return None
 
@@ -197,30 +239,37 @@ class InvoiceParser:
         """
         if not cell_text: return False
         
-        # Normalize: lower, strip dots, spaces, slashes, hyphens, and percent signs
-        def normalize(s):
-            return re.sub(r'[\.\s%/\-_]', '', str(s).lower())
-            
-        norm_cell = normalize(cell_text)
+        # Normalize: lower and strip all non-alphanumeric characters
+        norm_cell = re.sub(r'[^a-z0-9]', '', str(cell_text).lower())
+        if not norm_cell: return False
+
         aliases = InvoiceParser.COLUMN_MAP.get(target_key, [])
-        
-        # Fields that are structural and should NOT match as a substring of others
-        # (e.g., "qty" should not match "sch qty", "tax" should not match "taxable value")
-        structural_fields = {
-            "qty", "sch", "rate", "mrp", "sno", "rack", "hsn", "pack", 
-            "batch", "expiry", "disc_per", "sch_disc", "disc", "gst", "taxable_amt", "amount"
-        }
-        
         for alias in aliases:
-            norm_alias = normalize(alias)
+            norm_alias = re.sub(r'[^a-z0-9]', '', alias.lower())
             if norm_alias == norm_cell:
                 return True
-            
-            # Substring match only for non-structural fields OR if the cell contains the alias as a discrete word
-            if target_key not in structural_fields:
-                if norm_alias in norm_cell or norm_cell in norm_alias:
-                    if len(norm_alias) > 2:
-                        return True
+
+        # Special heuristic for expiry column
+        if target_key == "expiry":
+            raw_lower = str(cell_text).lower().strip()
+            if any(k in raw_lower for k in ["exp", "expiry", "ubd", "shelf life"]):
+                if not any(ex in raw_lower for ex in ["expense", "export", "express"]):
+                    return True
+            if "valid" in raw_lower and "value" not in raw_lower and "val." not in raw_lower:
+                return True
+
+        # Special heuristic for batch column
+        if target_key == "batch":
+            raw_lower = str(cell_text).lower().strip()
+            if any(k in raw_lower for k in ["batch", "lot", "b.no", "b no", "lot no", "bno"]):
+                return True
+
+        # Special heuristic for description column
+        if target_key == "description":
+            raw_lower = str(cell_text).lower().strip()
+            if any(k in raw_lower for k in ["description", "particulars", "item name", "product name", "medicine", "items", "material"]):
+                return True
+
         return False
 
     @staticmethod
@@ -243,6 +292,8 @@ class InvoiceParser:
             ]
 
         extracted_items = []
+        last_col_map = None
+        last_num_cols = 0
         
         for table in tables:
             if not table or len(table) < 2:
@@ -275,15 +326,23 @@ class InvoiceParser:
                     best_header_idx = i
                     best_col_map = col_map
 
+            # Multi-page fallback: reuse col_map from previous table if header not repeated
             if best_header_idx == -1 or not best_col_map:
-                continue
+                if last_col_map and abs(len(table[0]) - last_num_cols) <= 1 and max(last_col_map.values()) < len(table[0]):
+                    header_idx = -1
+                    col_map = last_col_map.copy()
+                else:
+                    continue
+            else:
+                header_idx = best_header_idx
+                col_map = best_col_map
+                last_col_map = col_map
+                last_num_cols = len(table[header_idx])
 
-            header_idx = best_header_idx
-            col_map = best_col_map
-            header_row = table[header_idx]
+            header_row = table[header_idx] if header_idx >= 0 else []
 
             # Resolve description column if missing from unmapped header cells
-            if col_map["description"] == -1:
+            if col_map["description"] == -1 and header_row:
                 used = set(v for v in col_map.values() if v != -1)
                 for j, cell in enumerate(header_row):
                     if j not in used and cell:
@@ -292,21 +351,26 @@ class InvoiceParser:
                             col_map["description"] = j
                             break
 
-            # Resolve expiry column if missing (check header text for exp / valid / edt / ubd)
-            if col_map["expiry"] == -1:
+            # Resolve expiry column if missing (strict check, no "val" substring!)
+            if col_map["expiry"] == -1 and header_row:
                 for j, cell in enumerate(header_row):
                     if cell:
-                        c_clean = re.sub(r'[\.\s%/\-_]', '', str(cell).lower())
-                        if any(k in c_clean for k in ["exp", "expiry", "val", "valid", "ubd", "edt", "edate"]):
+                        c_lower = str(cell).lower()
+                        if any(k in c_lower for k in ["exp", "expiry", "ubd", "shelf life"]):
+                            if not any(ex in c_lower for ex in ["expense", "export"]):
+                                col_map["expiry"] = j
+                                break
+                        elif "valid" in c_lower and "value" not in c_lower and "val." not in c_lower:
                             col_map["expiry"] = j
                             break
 
-            # Data-driven expiry column fallback: inspect data rows to identify column containing dates
+            # Data-driven expiry column fallback: inspect all data rows across all columns
             if col_map["expiry"] == -1:
                 col_date_counts = {}
-                for row in table[header_idx + 1: header_idx + 15]:
+                used_cols = set(v for k, v in col_map.items() if k in ["description", "qty", "sno", "rate", "amount", "taxable_amt"] and v != -1)
+                for row in table[header_idx + 1:]:
                     for j, cell in enumerate(row):
-                        if cell and j != col_map.get("description", -1):
+                        if cell and j not in used_cols:
                             exp_val = InvoiceParser._parse_and_verify_expiry(str(cell))
                             if exp_val:
                                 col_date_counts[j] = col_date_counts.get(j, 0) + 1
@@ -352,6 +416,7 @@ class InvoiceParser:
                     num_items = max(len(cell_lines.get(f, [])) for f in ["qty", "rate", "batch", "sno", "amount"] if cell_lines.get(f, []))
                     desc_lines = cell_lines.get("description", [])
                     exp_lines = cell_lines.get("expiry", [])
+                    batch_lines = cell_lines.get("batch", [])
 
                     for k in range(num_items):
                         item = {}
@@ -362,21 +427,25 @@ class InvoiceParser:
                             else:
                                 item[field] = "N/A"
 
-                        # Verify expiry for product k in collapsed block
-                        if len(exp_lines) == num_items and k < len(exp_lines):
-                            item["expiry"] = InvoiceParser._parse_and_verify_expiry(exp_lines[k]) or "N/A"
-                        else:
-                            # Mismatched line count: verify if batch has embedded expiry, else preserve N/A
-                            batch_val = item.get("batch", "N/A")
-                            if batch_val != "N/A":
-                                emb_exp, clean_b = InvoiceParser._extract_embedded_expiry(batch_val)
-                                if emb_exp:
-                                    item["expiry"] = emb_exp
-                                    item["batch"] = clean_b
-                                else:
-                                    item["expiry"] = "N/A"
-                            else:
-                                item["expiry"] = "N/A"
+                        # Extract and verify expiry for product k in collapsed block
+                        verified_exp = None
+                        if k < len(exp_lines) and exp_lines[k]:
+                            verified_exp = InvoiceParser._parse_and_verify_expiry(exp_lines[k])
+
+                        # Check batch line for product k
+                        if not verified_exp and k < len(batch_lines) and batch_lines[k]:
+                            emb_exp, clean_b = InvoiceParser._extract_embedded_expiry(batch_lines[k])
+                            if emb_exp:
+                                verified_exp = emb_exp
+                                item["batch"] = clean_b
+
+                        # Check description line for product k
+                        if not verified_exp and k < len(desc_lines) and desc_lines[k]:
+                            emb_exp, _ = InvoiceParser._extract_embedded_expiry(desc_lines[k])
+                            if emb_exp:
+                                verified_exp = emb_exp
+
+                        item["expiry"] = verified_exp if verified_exp else "N/A"
 
                         if item.get("description", "N/A") != "N/A":
                             extracted_items.append(item)
@@ -426,10 +495,20 @@ class InvoiceParser:
                     # If still not found, check description column of THIS SAME ROW
                     if not verified_exp:
                         desc_val = item.get("description", "N/A")
-                        if desc_val != "N/A" and "EXP" in desc_val.upper():
+                        if desc_val != "N/A":
                             emb_exp, clean_d = InvoiceParser._extract_embedded_expiry(desc_val)
                             if emb_exp:
                                 verified_exp = emb_exp
+
+                    # Check all unmapped cells in this exact row
+                    if not verified_exp:
+                        mapped_indices = set(col_map.values())
+                        for col_idx, cell in enumerate(row):
+                            if col_idx not in mapped_indices and cell:
+                                emb_exp = InvoiceParser._parse_and_verify_expiry(str(cell))
+                                if emb_exp:
+                                    verified_exp = emb_exp
+                                    break
 
                     item["expiry"] = verified_exp if verified_exp else "N/A"
 
