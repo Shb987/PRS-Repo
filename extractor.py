@@ -98,7 +98,7 @@ class PDFExtractor:
         extracted_text = []
         try:
             # Note: poppler must be installed on the system for pdf2image to work
-            pages = convert_from_path(pdf_path, dpi=300)
+            pages = convert_from_path(pdf_path, dpi=200)
             for i, page in enumerate(pages):
                 print(f"    [*] Performing OCR on page {i+1}...")
                 content = pytesseract.image_to_string(page)

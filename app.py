@@ -137,7 +137,7 @@ def extract_prescription():
             if mime_type == 'application/pdf':
                 # Convert PDF to images and use the first page
                 from pdf2image import convert_from_path
-                pages = convert_from_path(temp_path, dpi=300)
+                pages = convert_from_path(temp_path, dpi=200)
                 if pages:
                     image_path = os.path.join(temp_dir, f"temp_{os.path.basename(temp_path)}.jpg")
                     pages[0].save(image_path, "JPEG")

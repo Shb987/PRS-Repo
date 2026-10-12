@@ -9,5 +9,4 @@ services:
       - .env
     volumes:
       - .:/app
-    # For development/local testing, you might want to use flask with auto-reload instead of gunicorn
-    # command: python app.py
+    command: gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 300 --graceful-timeout 300 app:app
