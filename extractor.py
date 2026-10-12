@@ -43,37 +43,119 @@ class PDFExtractor:
 
     def extract_tables(self, pdf_path: str) -> List[List[List[str]]]:
         """
-        Extract tabular data from the PDF.
-        Attempts default line-based detection, falling back to text-aligned strategies
-        if no tables or single-row tables are detected.
+        Extract tabular data from the PDF using spatial geometry and row alignment.
+        Decomposes borderless/collapsed multi-line rows into individual product rows
+        using word-level bounding boxes and column boundaries, preserving empty cells.
         """
         all_tables = []
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
-                    tables = page.extract_tables()
-                    # If default extraction didn't find multi-row tables, try text-aligned strategy
-                    has_data_table = any(table and len(table) >= 2 for table in tables) if tables else False
-                    if not has_data_table:
+                    found_tables = page.find_tables()
+                    words = page.extract_words()
+                    
+                    if not found_tables:
+                        # Fallback to text-based table extraction if no lines found
                         text_tables = page.extract_tables(table_settings={
                             "vertical_strategy": "text",
                             "horizontal_strategy": "text",
                             "snap_tolerance": 3,
                             "join_tolerance": 3
                         })
-                        if any(table and len(table) >= 2 for table in text_tables):
-                            tables = text_tables
-                        else:
-                            line_text_tables = page.extract_tables(table_settings={
-                                "vertical_strategy": "lines",
-                                "horizontal_strategy": "text"
-                            })
-                            if any(table and len(table) >= 2 for table in line_text_tables):
-                                tables = line_text_tables
+                        for tbl in text_tables:
+                            if tbl:
+                                all_tables.append(tbl)
+                        continue
 
-                    for table in tables:
-                        if table:
-                            all_tables.append(table)
+                    for t in found_tables:
+                        raw_table = t.extract()
+                        if not raw_table or len(raw_table) < 2:
+                            continue
+
+                        # Check if any body row is collapsed (multi-line cells across transactional fields)
+                        header_idx = -1
+                        for i, row in enumerate(raw_table[:15]):
+                            row_str = " ".join(str(c).lower() for c in row if c)
+                            kw_count = sum(1 for kw in ["batch", "exp", "hsn", "mrp", "qty", "rate", "item", "product", "description"] if kw in row_str)
+                            if kw_count >= 2:
+                                header_idx = i
+                                break
+
+                        has_collapsed_row = False
+                        if header_idx != -1:
+                            for r_idx in range(header_idx + 1, len(raw_table)):
+                                row = raw_table[r_idx]
+                                if sum(1 for c in row if c and "\n" in str(c)) >= 2:
+                                    has_collapsed_row = True
+                                    break
+
+                        if not has_collapsed_row or header_idx >= len(t.rows):
+                            all_tables.append(raw_table)
+                            continue
+
+                        # Segment collapsed table rows using column boundaries and word bounding boxes
+                        header_cells = t.rows[header_idx].cells
+                        col_bboxes = []
+                        for j, cell in enumerate(header_cells):
+                            if cell is not None:
+                                col_bboxes.append((j, cell[0], cell[2])) # (col_idx, x0, x1)
+
+                        if not col_bboxes:
+                            all_tables.append(raw_table)
+                            continue
+
+                        segmented_table = []
+                        for i in range(header_idx + 1):
+                            segmented_table.append(raw_table[i])
+
+                        for r_idx in range(header_idx + 1, len(raw_table)):
+                            row = raw_table[r_idx]
+                            t_row = t.rows[r_idx] if r_idx < len(t.rows) else None
+                            multi_line = sum(1 for c in row if c and "\n" in str(c))
+
+                            if multi_line >= 2 and t_row is not None:
+                                r_bbox = t_row.bbox
+                                # Extract words within this row's spatial bounding box
+                                r_words = [
+                                    w for w in words
+                                    if r_bbox[0] - 2.0 <= w['x0'] and w['x1'] <= r_bbox[2] + 2.0
+                                    and r_bbox[1] - 1.0 <= w['top'] and w['bottom'] <= r_bbox[3] + 1.0
+                                ]
+
+                                # Cluster words into distinct product rows by vertical midpoint
+                                row_clusters = []
+                                for w in sorted(r_words, key=lambda x: (x['top'] + x['bottom'])/2):
+                                    y = (w['top'] + w['bottom'])/2
+                                    matched = False
+                                    for cluster in row_clusters:
+                                        mean_y = sum(cw['top'] + cw['bottom'] for cw in cluster)/(2*len(cluster))
+                                        if abs(y - mean_y) < 4.0:
+                                            cluster.append(w)
+                                            matched = True
+                                            break
+                                    if not matched:
+                                        row_clusters.append([w])
+
+                                # Reconstruct each row cluster into structured columns
+                                for cluster in row_clusters:
+                                    row_data = ["" for _ in range(len(header_cells))]
+                                    for w in cluster:
+                                        w_mid_x = (w['x0'] + w['x1']) / 2
+                                        assigned_col = -1
+                                        for col_idx, cx0, cx1 in col_bboxes:
+                                            if cx0 - 2.0 <= w_mid_x <= cx1 + 2.0:
+                                                assigned_col = col_idx
+                                                break
+                                        if assigned_col != -1:
+                                            if row_data[assigned_col]:
+                                                row_data[assigned_col] += " " + w['text']
+                                            else:
+                                                row_data[assigned_col] = w['text']
+                                    segmented_table.append(row_data)
+                            else:
+                                segmented_table.append(row)
+
+                        all_tables.append(segmented_table)
         except Exception as e:
             print(f"[!] Table extraction failed: {e}")
         return all_tables

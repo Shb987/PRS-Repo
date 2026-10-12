@@ -114,14 +114,12 @@ class InvoiceParser:
         if cleaned_upper in ["N/A", "NA", "NONE", "NIL", "-", "--", "NULL", "BLANK", "EMPTY"]:
             return None
 
-        # Reject obvious non-dates (pure prices, tax percentages, HSN codes)
-        if re.fullmatch(r'[\$£€₹]?\s*\d+[\.,]\d{2}%?', cleaned_upper):
-            m_dot = re.fullmatch(r'(\d{1,2})\.(\d{2})', cleaned_upper)
-            if m_dot:
-                m_val, y_val = int(m_dot.group(1)), int(m_dot.group(2))
-                if not (1 <= m_val <= 12 and 20 <= y_val <= 60):
-                    return None
-            else:
+        # Reject obvious non-dates (prices, tax percentages, HSN codes, single-digit floats)
+        if "%" in cleaned_upper or re.search(r'[\$£€₹]', cleaned_upper):
+            return None
+        if re.fullmatch(r'\d+[\.,]\d{2}', cleaned_upper):
+            m_dot = re.fullmatch(r'(0[1-9]|1[0-2])\.([2-4]\d)', cleaned_upper)
+            if not m_dot:
                 return None
 
         # Check for labeled expiry pattern first (e.g. EXP: 05/27, EXPIRY 10/26, E: 05/27, EDT: 04/28)
@@ -428,8 +426,9 @@ class InvoiceParser:
                                 item[field] = "N/A"
 
                         # Extract and verify expiry for product k in collapsed block
+                        # Strictly enforce 1:1 count alignment to prevent shifting compact date lists upward into blank rows
                         verified_exp = None
-                        if k < len(exp_lines) and exp_lines[k]:
+                        if len(exp_lines) == num_items and k < len(exp_lines) and exp_lines[k]:
                             verified_exp = InvoiceParser._parse_and_verify_expiry(exp_lines[k])
 
                         # Check batch line for product k
@@ -500,8 +499,8 @@ class InvoiceParser:
                             if emb_exp:
                                 verified_exp = emb_exp
 
-                    # Check all unmapped cells in this exact row
-                    if not verified_exp:
+                    # Check unmapped cells only if no dedicated expiry column was identified in the table
+                    if not verified_exp and col_map.get("expiry", -1) == -1:
                         mapped_indices = set(col_map.values())
                         for col_idx, cell in enumerate(row):
                             if col_idx not in mapped_indices and cell:
