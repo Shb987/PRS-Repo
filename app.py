@@ -28,21 +28,23 @@ def extract_admin():
 def extract_retailer():
     return process_extraction(mode='retailer')
 
+@app.route('/prs/<mode>/validate-invoice', methods=['POST'])
+@app.route('/prs/validate-invoice', methods=['POST'])
 @app.route('/validate', methods=['POST'])
 @app.route('/validate-invoice', methods=['POST'])
 @app.route('/extract-and-validate', methods=['POST'])
-def validate_invoice():
+def validate_invoice(mode='retailer'):
     """
     AI Invoice & Order Verification Endpoint.
-    Validates uploaded invoice PDF against order contents from Laravel.
-    Returns structured match/mismatch details according to Scenarios 1, 2, and 3.
+    Validates uploaded invoice PDF or image against order contents from Laravel.
+    Returns structured match/mismatch details according to the exact Laravel reconciliation schema.
     """
     # 1. Parse order_data from request
     order_data = None
     
     if request.is_json:
         req_data = request.get_json() or {}
-        order_data = req_data.get('order_data') or req_data.get('order') or req_data.get('order_details') or req_data
+        order_data = req_data.get('order_details') or req_data.get('order_data') or req_data.get('order') or req_data
         
         # If invoice raw text or parsed data was sent directly in JSON
         invoice_text = req_data.get('invoice_text') or req_data.get('raw_text') or ""
@@ -58,43 +60,46 @@ def validate_invoice():
             )
             return jsonify(result)
             
-    # Check form-data for order_data (e.g. sent alongside uploaded PDF)
-    if 'order_data' in request.form:
+    # Check form-data for order_details, order_data, or order (sent alongside uploaded PDF/Image)
+    order_raw = request.form.get('order_details') or request.form.get('order_data') or request.form.get('order')
+    if order_raw:
         try:
-            order_data = json.loads(request.form['order_data'])
+            order_data = json.loads(order_raw)
         except Exception:
-            order_data = request.form['order_data']
-    elif 'order' in request.form:
-        try:
-            order_data = json.loads(request.form['order'])
-        except Exception:
-            order_data = request.form['order']
+            order_data = order_raw
             
-    # Check for uploaded PDF file
-    if 'file' not in request.files:
+    # Check for uploaded file (PDF or Image)
+    file = request.files.get('file') or request.files.get('invoice') or request.files.get('document')
+    if not file or file.filename == '':
         if not order_data:
-            return jsonify({"error": "No file or order_data provided in the request"}), 400
+            return jsonify({"error": "No file or order_details provided in the request"}), 400
         return jsonify({"error": "No file part in the request"}), 400
 
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-
-    if not file.filename.lower().endswith('.pdf'):
-        return jsonify({"error": "Only PDF files are allowed"}), 400
+    filename_lower = file.filename.lower()
+    allowed_exts = ('.pdf', '.png', '.jpg', '.jpeg', '.webp', '.tiff', '.bmp')
+    if not any(filename_lower.endswith(ext) for ext in allowed_exts):
+        return jsonify({"error": f"Invalid file format. Allowed formats: {', '.join(allowed_exts)}"}), 400
 
     temp_dir = tempfile.gettempdir()
     temp_path = os.path.join(temp_dir, file.filename)
     file.save(temp_path)
 
     try:
-        # Extract text & tables from PDF
-        extraction_results = extractor.extract_text(temp_path)
-        raw_text = extraction_results["raw_text"]
-        tables = extractor.extract_tables(temp_path)
+        # Extract text & tables based on file type
+        if filename_lower.endswith('.pdf'):
+            extraction_results = extractor.extract_text(temp_path)
+            raw_text = extraction_results["raw_text"]
+            tables = extractor.extract_tables(temp_path)
+        else:
+            # Image file: OCR extraction
+            from PIL import Image
+            import pytesseract
+            img = Image.open(temp_path)
+            raw_text = pytesseract.image_to_string(img)
+            tables = []
 
         # Baseline parsing
-        parsed_invoice = InvoiceParser.parse(raw_text, tables, mode='retailer')
+        parsed_invoice = InvoiceParser.parse(raw_text, tables, mode=mode if mode in ['admin', 'retailer'] else 'retailer')
 
         # Validate against order data using AI Engine
         validation_result = invoice_validator.validate(
