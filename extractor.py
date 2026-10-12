@@ -44,12 +44,33 @@ class PDFExtractor:
     def extract_tables(self, pdf_path: str) -> List[List[List[str]]]:
         """
         Extract tabular data from the PDF.
+        Attempts default line-based detection, falling back to text-aligned strategies
+        if no tables or single-row tables are detected.
         """
         all_tables = []
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
                     tables = page.extract_tables()
+                    # If default extraction didn't find multi-row tables, try text-aligned strategy
+                    has_data_table = any(table and len(table) >= 2 for table in tables) if tables else False
+                    if not has_data_table:
+                        text_tables = page.extract_tables(table_settings={
+                            "vertical_strategy": "text",
+                            "horizontal_strategy": "text",
+                            "snap_tolerance": 3,
+                            "join_tolerance": 3
+                        })
+                        if any(table and len(table) >= 2 for table in text_tables):
+                            tables = text_tables
+                        else:
+                            line_text_tables = page.extract_tables(table_settings={
+                                "vertical_strategy": "lines",
+                                "horizontal_strategy": "text"
+                            })
+                            if any(table and len(table) >= 2 for table in line_text_tables):
+                                tables = line_text_tables
+
                     for table in tables:
                         if table:
                             all_tables.append(table)

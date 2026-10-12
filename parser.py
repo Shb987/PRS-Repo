@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 class InvoiceParser:
     """
@@ -14,10 +14,14 @@ class InvoiceParser:
             "item_name", "product_name"
         ],
         "hsn": ["hsn", "hsn code", "hsn/sac", "commodity code", "hsn/ sac"],
-        "batch": ["batch", "batch no", "batch number", "b.no", "lot no", "lot", "batchno"],
+        "batch": [
+            "batch", "batch no", "batch number", "b.no", "lot no", "lot", "batchno",
+            "b no", "b. no", "lot.no", "b.num", "batch/lot", "batch/exp", "b.no / exp", "batch / exp"
+        ],
         "expiry": [
             "exp", "expiry", "exp date", "expiry date", "exp.", "e.date", "expdt", 
-            "exp.date", "valid till"
+            "exp.date", "valid till", "exp dt", "exp.dt", "e.dt", "edate", "edt",
+            "validity", "valid upto", "val till", "use before", "ubd", "batch/exp", "b.no / exp", "batch / exp"
         ],
         "p_code": ["p.code", "p code", "product code", "item code", "code"],
         "qty": ["qty", "quantity", "qnty", "units"],
@@ -79,6 +83,113 @@ class InvoiceParser:
         return data
 
     @staticmethod
+    def _parse_and_verify_expiry(val: str) -> Optional[str]:
+        """
+        Validates that val contains a plausible expiry date and normalizes it to MM/YY.
+        Rejects non-dates such as tax rates, price amounts, HSN codes, or invalid months/years.
+        """
+        if not val or not str(val).strip():
+            return None
+
+        cleaned = str(val).strip()
+        cleaned_upper = cleaned.upper()
+
+        if cleaned_upper in ["N/A", "NA", "NONE", "NIL", "-", "--", "NULL", "BLANK"]:
+            return None
+
+        month_names = {
+            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+        }
+        m_regex = r"(JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
+
+        # 1. Named Month with Year: e.g. APR/28, APR-28, APR 2028, APR.28, OCT/26
+        m = re.search(r'\b' + m_regex + r'[\./\s-]+(?:20)?(\d{2})\b', cleaned_upper)
+        if m:
+            m_str = m.group(1)[:3]
+            if m_str in month_names:
+                month = month_names[m_str]
+                yy = int(m.group(2))
+                return f"{month:02d}/{yy:02d}"
+
+        # 2. Year with Named Month: e.g. 28-APR, 2028-APR, 28/APR, 26-OCT
+        m = re.search(r'\b(?:20)?(\d{2})[\./\s-]+' + m_regex + r'\b', cleaned_upper)
+        if m:
+            m_str = m.group(2)[:3]
+            if m_str in month_names:
+                month = month_names[m_str]
+                yy = int(m.group(1))
+                return f"{month:02d}/{yy:02d}"
+
+        # 3. ISO format: YYYY-MM-DD or YYYY/MM/DD
+        m = re.search(r'\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b', cleaned_upper)
+        if m:
+            yy = int(m.group(1)) % 100
+            month = int(m.group(2))
+            if 1 <= month <= 12:
+                return f"{month:02d}/{yy:02d}"
+
+        # 4. Full date: DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
+        m = re.search(r'\b(\d{1,2})[\./-](\d{1,2})[\./-](20\d{2})\b', cleaned_upper)
+        if m:
+            d, month, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            yy = yyyy % 100
+            if 1 <= month <= 12 and 1 <= d <= 31:
+                return f"{month:02d}/{yy:02d}"
+
+        # 5. MM/YYYY or MM-YYYY or MM.YYYY (4-digit year)
+        m = re.search(r'\b(\d{1,2})[\./\s-]+(20\d{2})\b', cleaned_upper)
+        if m:
+            month = int(m.group(1))
+            yy = int(m.group(2)) % 100
+            if 1 <= month <= 12 and 20 <= yy <= 45:
+                return f"{month:02d}/{yy:02d}"
+
+        # 6. YYYY/MM or YYYY-MM (4-digit year first)
+        m = re.search(r'\b(20\d{2})[\./\s-]+(\d{1,2})\b', cleaned_upper)
+        if m:
+            yy = int(m.group(1)) % 100
+            month = int(m.group(2))
+            if 1 <= month <= 12 and 20 <= yy <= 45:
+                return f"{month:02d}/{yy:02d}"
+
+        # 7. MM/YY or MM-YY or MM.YY or MM / YY (2-digit year)
+        m = re.search(r'\b(\d{1,2})\s*[\./-]\s*(\d{2})\b', cleaned_upper)
+        if m:
+            p1 = int(m.group(1))
+            p2 = int(m.group(2))
+            if 1 <= p1 <= 12 and 20 <= p2 <= 45:
+                return f"{p1:02d}/{p2:02d}"
+            elif 20 <= p1 <= 45 and 1 <= p2 <= 12:
+                return f"{p2:02d}/{p1:02d}"
+
+        # 8. Contiguous 4 digits: MMYY (e.g. 0527)
+        m = re.search(r'\b(\d{2})(\d{2})\b', cleaned_upper)
+        if m:
+            p1, p2 = int(m.group(1)), int(m.group(2))
+            if 1 <= p1 <= 12 and 24 <= p2 <= 40:
+                return f"{p1:02d}/{p2:02d}"
+
+        return None
+
+    @staticmethod
+    def _extract_embedded_expiry(text: str) -> Tuple[Optional[str], str]:
+        """
+        Extracts an embedded expiry date from a combined string (e.g., in batch or description),
+        returning (verified_expiry, cleaned_text).
+        """
+        if not text:
+            return None, text
+        exp_val = InvoiceParser._parse_and_verify_expiry(text)
+        if exp_val:
+            cleaned = re.sub(r'(?:EXP(?:IRY)?[:\.\s]*)?\b\d{1,2}\s*[\./-]\s*(?:20)?\d{2}\b', '', text, flags=re.IGNORECASE)
+            cleaned = re.sub(r'(?:EXP(?:IRY)?[:\.\s]*)?\b(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*[\./\s-]+(?:20)?\d{2}\b', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'[\s/,-]+$', '', cleaned).strip()
+            cleaned = re.sub(r'^[\s/,-]+', '', cleaned).strip()
+            return exp_val, (cleaned if cleaned else "N/A")
+        return None, text
+
+    @staticmethod
     def _is_column_match(cell_text: str, target_key: str) -> bool:
         """
         Checks if a cell text matches any of the aliases for a target column.
@@ -86,9 +197,9 @@ class InvoiceParser:
         """
         if not cell_text: return False
         
-        # Normalize: lower, strip dots, spaces, and percent signs
+        # Normalize: lower, strip dots, spaces, slashes, hyphens, and percent signs
         def normalize(s):
-            return re.sub(r'[\.\s%]', '', str(s).lower())
+            return re.sub(r'[\.\s%/\-_]', '', str(s).lower())
             
         norm_cell = normalize(cell_text)
         aliases = InvoiceParser.COLUMN_MAP.get(target_key, [])
@@ -115,7 +226,8 @@ class InvoiceParser:
     @staticmethod
     def parse_line_items(tables: List[List[List[str]]], mode: str = "admin") -> List[Dict[str, Any]]:
         """
-        Identifies columns dynamically using fuzzy keyword matching.
+        Extracts line items from tables, verifying that every product line item's
+        expiry date strictly belongs to that specific product row in the original PDF.
         """
         # Fields to extract for each mode
         if mode == "admin":
@@ -136,59 +248,193 @@ class InvoiceParser:
             if not table or len(table) < 2:
                 continue
             
-            # 1. Find the header row and identify column indexes
-            header_idx = -1
-            col_map = {field: -1 for field in target_fields}
-            
-            for i, row in enumerate(table):
-                row_str = " ".join([str(c) for c in row if c]).lower()
-                # Use a balanced set of keywords to find the header row
-                if any(k in row_str for k in ["batch", "exp", "hsn", "mrp", "qty"]):
-                    header_idx = i
-                    for j, cell in enumerate(row):
-                        if not cell: continue
-                        for field in target_fields:
-                            if InvoiceParser._is_column_match(cell, field):
-                                col_map[field] = j
-                                # Note: We don't break here because one cell might match multiple (unlikely but safe)
-                    break
-            
-            # 2. Extract data if we found the necessary columns (at least description and batch/exp)
-            if header_idx != -1 and (col_map["description"] != -1):
-                for row in table[header_idx + 1:]:
-                    if not any(row): continue
-                    
-                    # Prepare raw values for each field
-                    raw_data = {}
-                    for field, idx in col_map.items():
-                        if idx != -1 and idx < len(row) and row[idx]:
-                            raw_data[field] = str(row[idx]).strip().split('\n')
-                        else:
-                            raw_data[field] = ["N/A"]
+            # 1. Header row identification by scoring matches
+            best_header_idx = -1
+            best_col_map = None
+            best_score = -1
 
-                    # Determine the number of sub-rows (take the maximum lines found in any column)
-                    num_lines = max(len(lines) for lines in raw_data.values())
-                    
-                    for i in range(num_lines):
+            for i, row in enumerate(table[:15]):
+                if not any(row):
+                    continue
+                col_map = {field: -1 for field in target_fields}
+                matched_count = 0
+                for j, cell in enumerate(row):
+                    if not cell: continue
+                    for field in target_fields:
+                        if InvoiceParser._is_column_match(cell, field):
+                            if col_map[field] == -1:
+                                col_map[field] = j
+                                matched_count += 1
+
+                row_str = " ".join([str(c).lower() for c in row if c])
+                kw_count = sum(1 for kw in ["batch", "exp", "hsn", "mrp", "qty", "rate", "item", "product", "description", "particulars"] if kw in row_str)
+                score = matched_count * 2 + kw_count
+
+                if score > best_score and (matched_count >= 2 or kw_count >= 2):
+                    best_score = score
+                    best_header_idx = i
+                    best_col_map = col_map
+
+            if best_header_idx == -1 or not best_col_map:
+                continue
+
+            header_idx = best_header_idx
+            col_map = best_col_map
+            header_row = table[header_idx]
+
+            # Resolve description column if missing from unmapped header cells
+            if col_map["description"] == -1:
+                used = set(v for v in col_map.values() if v != -1)
+                for j, cell in enumerate(header_row):
+                    if j not in used and cell:
+                        c_clean = str(cell).lower()
+                        if any(k in c_clean for k in ["item", "product", "desc", "particulars", "name"]):
+                            col_map["description"] = j
+                            break
+
+            # Resolve expiry column if missing (check header text for exp / valid / edt / ubd)
+            if col_map["expiry"] == -1:
+                for j, cell in enumerate(header_row):
+                    if cell:
+                        c_clean = re.sub(r'[\.\s%/\-_]', '', str(cell).lower())
+                        if any(k in c_clean for k in ["exp", "expiry", "val", "valid", "ubd", "edt", "edate"]):
+                            col_map["expiry"] = j
+                            break
+
+            # Data-driven expiry column fallback: inspect data rows to identify column containing dates
+            if col_map["expiry"] == -1:
+                col_date_counts = {}
+                for row in table[header_idx + 1: header_idx + 15]:
+                    for j, cell in enumerate(row):
+                        if cell and j != col_map.get("description", -1):
+                            exp_val = InvoiceParser._parse_and_verify_expiry(str(cell))
+                            if exp_val:
+                                col_date_counts[j] = col_date_counts.get(j, 0) + 1
+                if col_date_counts:
+                    best_exp_col = max(col_date_counts.items(), key=lambda x: x[1])[0]
+                    if col_date_counts[best_exp_col] >= 1:
+                        col_map["expiry"] = best_exp_col
+
+            # Skip table if description column could not be found
+            if col_map["description"] == -1:
+                continue
+
+            # 2. Extract line items row by row, strictly preserving row-to-product alignment
+            for row in table[header_idx + 1:]:
+                if not any(row):
+                    continue
+
+                # Skip summary or total rows
+                first_cells = " ".join([str(c).lower().strip() for c in row[:3] if c])
+                if any(k in first_cells for k in ["total", "grand total", "net payable", "sub total", "taxable value", "round off"]):
+                    continue
+
+                # Skip repeated headers
+                row_str_check = " ".join([str(c).lower() for c in row if c])
+                if "hsn" in row_str_check and "qty" in row_str_check and "batch" in row_str_check:
+                    continue
+
+                # Prepare cell lines
+                cell_lines = {}
+                for field in target_fields:
+                    idx = col_map[field]
+                    if idx != -1 and idx < len(row) and row[idx] is not None:
+                        lines = [line.strip() for line in str(row[idx]).split('\n') if line.strip()]
+                        cell_lines[field] = lines if lines else []
+                    else:
+                        cell_lines[field] = []
+
+                # Check if this row is a collapsed multi-product block
+                multi_line_counts = sum(1 for f in ["qty", "rate", "batch", "sno", "mrp", "amount"] if len(cell_lines.get(f, [])) > 1)
+                is_collapsed = (multi_line_counts >= 2)
+
+                if is_collapsed:
+                    num_items = max(len(cell_lines.get(f, [])) for f in ["qty", "rate", "batch", "sno", "amount"] if cell_lines.get(f, []))
+                    desc_lines = cell_lines.get("description", [])
+                    exp_lines = cell_lines.get("expiry", [])
+
+                    for k in range(num_items):
                         item = {}
                         for field in target_fields:
-                            lines = raw_data[field]
-                            item[field] = lines[i].strip() if i < len(lines) and lines[i].strip() else "N/A"
-                        
-                        # Filtering rule: remove if description is N/A or it has mostly N/A values
-                        vals = list(item.values())
-                        na_count = vals.count("N/A")
-                        
-                        if item["description"] != "N/A":
-                            # Description merging logic:
-                            # If most other fields are N/A, it's likely a continuation of the previous item's description
-                            is_continuation = na_count >= (len(target_fields) - 2)
-                            
-                            if is_continuation and extracted_items:
-                                prev_desc = extracted_items[-1]["description"]
-                                extracted_items[-1]["description"] = f"{prev_desc} {item['description']}".strip()
-                            elif not is_continuation:
-                                extracted_items.append(item)
+                            lines = cell_lines.get(field, [])
+                            if k < len(lines) and lines[k]:
+                                item[field] = lines[k]
+                            else:
+                                item[field] = "N/A"
+
+                        # Verify expiry for product k in collapsed block
+                        if len(exp_lines) == num_items and k < len(exp_lines):
+                            item["expiry"] = InvoiceParser._parse_and_verify_expiry(exp_lines[k]) or "N/A"
+                        else:
+                            # Mismatched line count: verify if batch has embedded expiry, else preserve N/A
+                            batch_val = item.get("batch", "N/A")
+                            if batch_val != "N/A":
+                                emb_exp, clean_b = InvoiceParser._extract_embedded_expiry(batch_val)
+                                if emb_exp:
+                                    item["expiry"] = emb_exp
+                                    item["batch"] = clean_b
+                                else:
+                                    item["expiry"] = "N/A"
+                            else:
+                                item["expiry"] = "N/A"
+
+                        if item.get("description", "N/A") != "N/A":
+                            extracted_items.append(item)
+
+                else:
+                    # Standard grid row (1 product row in PDF)
+                    item = {}
+                    for field in target_fields:
+                        idx = col_map[field]
+                        if idx != -1 and idx < len(row) and row[idx] is not None:
+                            val = " ".join(part for part in str(row[idx]).split('\n') if part.strip())
+                            item[field] = val if val and val.upper() not in ["N/A", "NA", "NONE", "NIL", "-", "--"] else "N/A"
+                        else:
+                            item[field] = "N/A"
+
+                    # Check for description continuation row:
+                    # If description is present, but ALL transactional fields are N/A:
+                    desc_val = item.get("description", "N/A")
+                    if desc_val != "N/A":
+                        transactional_fields = ["qty", "rate", "mrp", "amount", "batch", "expiry", "sno"]
+                        has_trans = any(item.get(f, "N/A") != "N/A" for f in transactional_fields if f in target_fields)
+                        if not has_trans and extracted_items:
+                            # Append to previous product's description without shifting fields
+                            extracted_items[-1]["description"] = f"{extracted_items[-1]['description']} {desc_val}".strip()
+                            continue
+
+                    # Verify expiry date strictly belongs to THIS product row
+                    raw_exp = item.get("expiry", "N/A")
+                    verified_exp = InvoiceParser._parse_and_verify_expiry(raw_exp) if raw_exp != "N/A" else None
+
+                    # Check if batch and expiry share the same column or if batch has embedded expiry
+                    batch_val = item.get("batch", "N/A")
+                    if batch_val != "N/A":
+                        emb_exp, clean_b = InvoiceParser._extract_embedded_expiry(batch_val)
+                        if emb_exp:
+                            if not verified_exp:
+                                verified_exp = emb_exp
+                            item["batch"] = clean_b
+
+                    # If expiry column was identical to batch column, and no expiry found yet
+                    if col_map.get("batch") == col_map.get("expiry") and col_map.get("expiry") != -1:
+                        if not verified_exp:
+                            item["expiry"] = "N/A"
+                        else:
+                            item["expiry"] = verified_exp
+
+                    # If still not found, check description column of THIS SAME ROW
+                    if not verified_exp:
+                        desc_val = item.get("description", "N/A")
+                        if desc_val != "N/A" and "EXP" in desc_val.upper():
+                            emb_exp, clean_d = InvoiceParser._extract_embedded_expiry(desc_val)
+                            if emb_exp:
+                                verified_exp = emb_exp
+
+                    item["expiry"] = verified_exp if verified_exp else "N/A"
+
+                    if item.get("description", "N/A") != "N/A":
+                        extracted_items.append(item)
                         
         return extracted_items
 
