@@ -28,17 +28,43 @@ def extract_admin():
 def extract_retailer():
     return process_extraction(mode='retailer')
 
-@app.route('/prs/<mode>/validate-invoice', methods=['POST'])
-@app.route('/prs/validate-invoice', methods=['POST'])
-@app.route('/validate', methods=['POST'])
-@app.route('/validate-invoice', methods=['POST'])
-@app.route('/extract-and-validate', methods=['POST'])
-def validate_invoice(mode='retailer'):
+@app.route('/prs/<order_type>/validate-invoice', methods=['GET', 'POST'], strict_slashes=False)
+@app.route('/prs/<order_type>/validate_invoice', methods=['GET', 'POST'], strict_slashes=False)
+@app.route('/prs/validate-invoice', methods=['GET', 'POST'], strict_slashes=False)
+@app.route('/prs/validate_invoice', methods=['GET', 'POST'], strict_slashes=False)
+@app.route('/validate', methods=['GET', 'POST'], strict_slashes=False)
+@app.route('/validate-invoice', methods=['GET', 'POST'], strict_slashes=False)
+@app.route('/extract-and-validate', methods=['GET', 'POST'], strict_slashes=False)
+def validate_invoice(order_type='retailer', mode=None, **kwargs):
     """
     AI Invoice & Order Verification Endpoint.
     Validates uploaded invoice PDF or image against order contents from Laravel.
+    Supports both /prs/validate-invoice and /prs/{order_type}/validate-invoice.
     Returns structured match/mismatch details according to the exact Laravel reconciliation schema.
     """
+    if request.method == 'GET':
+        return jsonify({
+            "status": "ready",
+            "service": "AI Invoice Validation Engine",
+            "endpoints": [
+                "/prs/validate-invoice",
+                "/prs/<order_type>/validate-invoice"
+            ],
+            "method": "POST",
+            "description": "Upload invoice file (PDF/image) and order_details JSON payload to validate."
+        }), 200
+
+    # Resolve order_type / mode from URL route parameters, query args, or form data
+    resolved_order_type = (
+        order_type or 
+        mode or 
+        request.args.get('order_type') or 
+        request.args.get('mode') or 
+        (request.get_json(silent=True) or {}).get('order_type') or 
+        request.form.get('order_type') or 
+        'retailer'
+    )
+    active_mode = resolved_order_type if resolved_order_type in ['admin', 'retailer'] else 'retailer'
     # 1. Parse order_data from request
     order_data = None
     
@@ -99,7 +125,7 @@ def validate_invoice(mode='retailer'):
             tables = []
 
         # Baseline parsing
-        parsed_invoice = InvoiceParser.parse(raw_text, tables, mode=mode if mode in ['admin', 'retailer'] else 'retailer')
+        parsed_invoice = InvoiceParser.parse(raw_text, tables, mode=active_mode)
 
         # Validate against order data using AI Engine
         validation_result = invoice_validator.validate(
@@ -209,11 +235,16 @@ def process_extraction(mode):
                 )
                 extracted_data["validation"] = validation
                 extracted_data["match_status"] = validation.get("match_status", "matched")
+                extracted_data["match_percentage"] = validation.get("match_percentage", 0)
                 extracted_data["summary"] = validation.get("summary", "")
+                extracted_data["missing_items"] = validation.get("missing_items", [])
+                extracted_data["extra_items"] = validation.get("extra_items", [])
+                extracted_data["reconciled_items"] = validation.get("reconciled_items", [])
                 if "data" in validation:
                     extracted_data["data"] = validation["data"]
             else:
                 extracted_data["match_status"] = "unverified"
+                extracted_data["match_percentage"] = 0
 
             # 3. Return full data (metadata + line items)
             return jsonify(extracted_data)

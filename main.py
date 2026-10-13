@@ -55,7 +55,8 @@ def print_validation_output(validation_result):
     print("="*60)
     print(f"Status       : {validation_result.get('status', '').upper()}")
     print(f"Match Status : {validation_result.get('match_status', '').upper()}")
-    print(f"Message      : {validation_result.get('message', '')}")
+    print(f"Match %      : {validation_result.get('match_percentage', 0)}%")
+    print(f"Summary      : {validation_result.get('summary', validation_result.get('message', ''))}")
     print("-" * 60)
     
     meta = validation_result.get('extracted_metadata', {})

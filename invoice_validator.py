@@ -111,54 +111,163 @@ class InvoiceValidator:
             return 0.0
 
     @staticmethod
-    def _match_product(order_item: Dict[str, Any], inv_item: Dict[str, Any]) -> bool:
+    def _normalize_product_code(code_str: Optional[str]) -> Optional[str]:
+        if not code_str or str(code_str).upper() in ["N/A", "NONE", "NULL", "BLANK", ""]:
+            return None
+        # Remove whitespace, hyphens, slashes, underscores for robust comparison:
+        # e.g., 'AS-D23' -> 'ASD23', 'BP-05' -> 'BP05', 'AS - D23' -> 'ASD23'
+        cleaned = re.sub(r'[^A-Z0-9]', '', str(code_str).upper())
+        return cleaned if cleaned else None
+
+    @staticmethod
+    def _normalize_size_tag(size_str: Optional[str]) -> Optional[str]:
+        if not size_str or str(size_str).upper() in ["N/A", "NONE", "NULL", "BLANK", ""]:
+            return None
+        s = re.sub(r'[\[\]\(\)\{\}\s]', '', str(size_str)).upper()
+        mapping = {
+            "2XL": "XXL",
+            "3XL": "XXXL",
+            "SMALL": "S",
+            "MEDIUM": "M",
+            "LARGE": "L",
+            "EXTRALARGE": "XL",
+            "FREESIZE": "FS",
+            "FREE": "FS"
+        }
+        return mapping.get(s, s)
+
+    @classmethod
+    def _extract_product_code(cls, text: str) -> Optional[str]:
+        from parser import InvoiceParser
+        return InvoiceParser._extract_product_code(text)
+
+    @classmethod
+    def _extract_size_tag(cls, text: str) -> Optional[str]:
+        from parser import InvoiceParser
+        return InvoiceParser._extract_size_tag(text)
+
+    @classmethod
+    def _match_product(cls, order_item: Dict[str, Any], inv_item: Dict[str, Any]) -> bool:
         """
         Determines whether an invoice line item matches an ordered product variant.
-        Handles core token matching, size variants (S, M, L, XL, XXL), and side variants (LEFT, RIGHT).
+        Handles:
+        - Product code recognition (e.g. AS-D23, BP-05) both in dedicated columns and embedded in descriptions.
+        - Size variant tags (e.g. [L], [M], [S], (XL), XXL) with strict variant preservation.
+        - Side variants (LEFT, RIGHT).
+        - Substring and token matching for product descriptions.
         """
         order_name = (order_item.get("product_name") or order_item.get("name") or "").upper().strip()
         inv_desc = (inv_item.get("description") or inv_item.get("item_name") or "").upper().strip()
 
-        order_size = (order_item.get("size") or order_item.get("variant_label") or "").upper().strip()
-        order_side = (order_item.get("side") or "").upper().strip()
+        # 1. Product Code Extraction & Normalization
+        order_raw_code = (
+            order_item.get("product_code") or 
+            order_item.get("code") or 
+            order_item.get("p_code") or 
+            order_item.get("item_code") or 
+            order_item.get("sku") or 
+            cls._extract_product_code(order_name)
+        )
+        inv_raw_code = (
+            inv_item.get("p_code") or 
+            inv_item.get("product_code") or 
+            inv_item.get("code") or 
+            inv_item.get("item_code") or 
+            cls._extract_product_code(inv_desc)
+        )
 
+        norm_ord_code = cls._normalize_product_code(order_raw_code)
+        norm_inv_code = cls._normalize_product_code(inv_raw_code)
+
+        # 2. Size Variant Extraction & Normalization
+        order_raw_size = (
+            order_item.get("size") or 
+            order_item.get("variant_label") or 
+            order_item.get("variant") or 
+            cls._extract_size_tag(order_name)
+        )
+        inv_raw_size = (
+            inv_item.get("size") or 
+            inv_item.get("variant") or 
+            cls._extract_size_tag(inv_desc)
+        )
+
+        norm_ord_size = cls._normalize_size_tag(order_raw_size)
+        norm_inv_size = cls._normalize_size_tag(inv_raw_size)
+
+        # 3. Side Variant Extraction
+        order_side = (order_item.get("side") or ("LEFT" if "LEFT" in order_name else ("RIGHT" if "RIGHT" in order_name else ""))).upper().strip()
+        inv_side = (inv_item.get("side") or ("LEFT" if "LEFT" in inv_desc else ("RIGHT" if "RIGHT" in inv_desc else ""))).upper().strip()
+
+        # --- VARIANT COMPATIBILITY CHECKS ---
+        # A. Size Variant Conflict: If both specify a size and they differ -> Mismatch!
+        if norm_ord_size and norm_inv_size and norm_ord_size != norm_inv_size:
+            return False
+
+        # If order specifies size, but invoice didn't explicitly extract one, check if inv_desc has conflicting size
+        if norm_ord_size and not norm_inv_size:
+            detected_inv_size = cls._extract_size_tag(inv_desc)
+            if detected_inv_size and detected_inv_size != norm_ord_size:
+                return False
+
+        # If invoice specifies size, but order didn't, check if order_name has conflicting size
+        if norm_inv_size and not norm_ord_size:
+            detected_ord_size = cls._extract_size_tag(order_name)
+            if detected_ord_size and detected_ord_size != norm_inv_size:
+                return False
+
+        # B. Side Variant Conflict (LEFT vs RIGHT)
+        if order_side in ["LEFT", "RIGHT"] and inv_side in ["LEFT", "RIGHT"]:
+            if order_side != inv_side:
+                return False
+        elif order_side in ["LEFT", "RIGHT"]:
+            opp_side = "RIGHT" if order_side == "LEFT" else "LEFT"
+            if re.search(r'\b' + opp_side + r'\b', inv_desc):
+                return False
+
+        # --- PRODUCT CODE MATCHING ---
+        # If BOTH have product codes:
+        if norm_ord_code and norm_inv_code:
+            if norm_ord_code == norm_inv_code:
+                # Matching product codes + matching sizes = definite match!
+                return True
+            else:
+                # Distinct explicit product codes (e.g. AS-D23 vs BP-05) -> Not the same product
+                return False
+
+        # If only order has product code, check if it's embedded in invoice description
+        if norm_ord_code and not norm_inv_code:
+            norm_inv_desc_all = re.sub(r'[^A-Z0-9]', '', inv_desc)
+            if norm_ord_code in norm_inv_desc_all:
+                return True
+
+        # If only invoice has product code, check if it's embedded in order product name
+        if norm_inv_code and not norm_ord_code:
+            norm_ord_name_all = re.sub(r'[^A-Z0-9]', '', order_name)
+            if norm_inv_code in norm_ord_name_all:
+                return True
+
+        # --- DESCRIPTIVE TOKEN & FUZZY MATCHING ---
         clean_ord_tokens = set(re.findall(r'[A-Z0-9]+', order_name))
         clean_inv_tokens = set(re.findall(r'[A-Z0-9]+', inv_desc))
 
-        # Filter out generic pharmaceutical descriptors
+        # Filter out generic pharmaceutical descriptors and size tokens from token set
         generic_tokens = {
             "ITEM", "ITEMS", "PRODUCT", "PRODUCTS", "MEDICINE", "TAB", "TABLET", "CAP", "CAPSULE",
-            "SYRUP", "INJ", "INJECTION", "PRO", "AIR", "PAIR", "THE", "AND", "OF", "MG", "ML", "GM"
+            "SYRUP", "INJ", "INJECTION", "PRO", "AIR", "PAIR", "THE", "AND", "OF", "MG", "ML", "GM",
+            "NOS", "BOX", "STRIP", "PACK", "S", "M", "L", "XL", "XXL", "XXXL", "XS"
         }
         core_tokens = [t for t in clean_ord_tokens if t not in generic_tokens]
 
         if core_tokens:
             overlap = sum(1 for t in core_tokens if (t in clean_inv_tokens) or (len(t) > 3 and any(t in it for it in clean_inv_tokens)))
-            if overlap / len(core_tokens) < 0.6:
-                return False
+            if overlap / len(core_tokens) >= 0.5:
+                return True
         else:
-            if order_name not in inv_desc and inv_desc not in order_name:
-                return False
+            if order_name and (order_name in inv_desc or inv_desc in order_name):
+                return True
 
-        # Side variant validation
-        if order_side in ["LEFT", "RIGHT"]:
-            if order_side not in clean_inv_tokens and order_side not in inv_desc:
-                opp_side = "RIGHT" if order_side == "LEFT" else "LEFT"
-                if opp_side in clean_inv_tokens or opp_side in inv_desc:
-                    return False
-
-        # Size variant validation
-        if order_size in ["S", "M", "L", "XL", "XXL", "XXXL"]:
-            inv_size_tokens = set(re.findall(r'\b(S|M|L|XL|XXL|XXXL)\b', inv_desc))
-            if inv_size_tokens:
-                if order_size not in inv_size_tokens:
-                    return False
-            else:
-                if not re.search(r'\b' + re.escape(order_size) + r'\b', inv_desc):
-                    if not inv_desc.endswith(" " + order_size) and not inv_desc.endswith("(" + order_size + ")"):
-                        return False
-
-        return True
+        return False
 
     def _validate_with_openai(
         self,
@@ -195,10 +304,14 @@ Order Items:
 
 ---
 ### RECONCILIATION RULES:
-1. `match_status`:
-   - "matched": All items and required quantities are fulfilled.
-   - "partial_match": Some items have partial quantities, substitutions, missing items, or extra non-ordered items.
-   - "mismatched": Completely incorrect invoice (wrong customer, unrelated products).
+1. `match_status` and `match_percentage`:
+   - `total_ordered_items`: Total number of distinct items/products in the order.
+   - `matched_items`: Number of distinct ordered items that exist on the invoice (even if fulfilled with partial quantity).
+   - Calculate: `match_percentage = (matched_items / total_ordered_items) * 100`.
+   - "matched": match_percentage == 100% with matching quantities fulfilled.
+   - "partial_match": match_percentage >= 50% (at least half the ordered products exist on the invoice, or all exist but quantities differ).
+   - "blocked": match_percentage < 50% or 0% (document appears to be for a different order or insufficient fulfillment).
+   - IMPORTANT: If an item is partially fulfilled (e.g. ordered 10, invoiced 4), place it in `reconciled_items` with match_status="partial_match". Do NOT place partially fulfilled items in `missing_items`. `missing_items` is strictly for products with 0 units on the invoice.
 2. `batches` Array per Item:
    When an item is fulfilled using multiple batches (e.g. 12 in ASKCM1225 and 8 in KCM02261), group them in that item's `batches` array rather than returning disconnected line items.
 3. `invoiced_qty`:
@@ -212,6 +325,8 @@ Order Items:
 7. `expiry_date` in `batches`:
    ALWAYS extract the batch expiration date from PRE-PARSED INVOICE DATA (field 'expiry') or tables/text. Convert month/year formats like "01/31" into standard ISO "YYYY-MM-DD" (e.g. "2031-01-31", "02/31" -> "2031-02-28", "06/30" -> "2030-06-30"). Never return null when an expiry date is present in the invoice or pre-parsed data.
 8. `summary`:
+   - If blocked (0%): "None of the ordered items were found in the uploaded invoice. Document appears to be for a different order."
+   - If blocked (< 50%): "Verification Blocked: Only <N> of <T> ordered items matched (<P>%). Document appears to be for a different order."
    - If matched: "All <N> ordered items matched across <V> variants with <F> free units fulfilled."
    - If extra items only: "Verification Mismatch: Contains <X> extra items not in order. Please verify before approving."
    - If missing & extra: "Verification Mismatch: Missing <M> ordered items. Contains <X> extra items not in order. Please verify before approving."
@@ -221,10 +336,15 @@ Order Items:
 Return ONLY valid JSON matching this schema:
 {{
   "success": true,
-  "match_status": "matched" | "partial_match" | "mismatched",
+  "match_status": "matched" | "partial_match" | "blocked",
+  "match_percentage": number,
   "summary": "string",
+  "missing_items": [ ... ],
+  "extra_items": [ ... ],
+  "reconciled_items": [ ... ],
   "data": {{
-    "match_status": "matched" | "partial_match" | "mismatched",
+    "match_status": "matched" | "partial_match" | "blocked",
+    "match_percentage": number,
     "invoice_metadata": {{
       "invoice_no": "string",
       "invoice_date": "string (YYYY-MM-DD)",
@@ -422,29 +542,53 @@ Return ONLY valid JSON matching this schema:
                     "net_amount": round(amt, 2)
                 })
 
-        # Determine match status and human-readable summary
-        total_ord_qty = sum(self._to_float(o.get("order_qty") or o.get("quantity")) for o in order_items)
-        total_fulfilled = sum(r["invoiced_qty"] for r in reconciled_items)
-        total_free = sum(r["free_qty"] for r in reconciled_items)
+        # Determine match_percentage, match_status and human-readable summary
+        total_ordered_items = len(order_items)
+        matched_items_count = len(reconciled_items)
 
-        if len(reconciled_items) == 0:
-            match_status = "mismatched"
-            summary = "Completely incorrect invoice. No ordered items matched."
-        elif len(missing_items) == 0 and len(extra_items) == 0 and total_fulfilled >= total_ord_qty:
-            match_status = "matched"
-            summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
-        elif len(missing_items) > 0 and len(extra_items) > 0:
-            match_status = "partial_match"
-            summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Contains {len(extra_items)} extra items not in order. Please verify before approving."
-        elif len(extra_items) > 0:
-            match_status = "partial_match"
-            summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order. Please verify before approving."
-        elif len(missing_items) > 0:
-            match_status = "partial_match"
-            summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Please verify before approving."
+        if total_ordered_items > 0:
+            calc_pct = round((matched_items_count / total_ordered_items) * 100, 2)
+            match_percentage = int(calc_pct) if calc_pct.is_integer() else calc_pct
         else:
+            match_percentage = 0
+
+        # Check if quantities match for all reconciled items
+        all_quantities_fulfilled = True
+        for item in reconciled_items:
+            ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
+            inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
+            if inv_q < ord_q:
+                all_quantities_fulfilled = False
+                break
+
+        # Match status classification
+        # "matched": match_percentage == 100% with matching quantities.
+        # "partial_match": match_percentage >= 50% (at least half the ordered products exist on the invoice).
+        # "blocked" / "unmatched": match_percentage < 50% or 0%.
+        if match_percentage == 100 and all_quantities_fulfilled and len(missing_items) == 0:
+            match_status = "matched"
+            total_ord_qty = sum(r["ordered_qty"] for r in reconciled_items)
+            total_free = sum(r["free_qty"] for r in reconciled_items)
+            if len(extra_items) > 0:
+                summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order."
+            else:
+                summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
+        elif match_percentage >= 50:
             match_status = "partial_match"
-            summary = f"Verification Mismatch: Invoiced quantity ({int(total_fulfilled)}) differs from ordered quantity ({int(total_ord_qty)})."
+            if len(missing_items) > 0 and len(extra_items) > 0:
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Contains {len(extra_items)} extra items not in order. Please verify before approving."
+            elif len(extra_items) > 0:
+                summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order. Please verify before approving."
+            elif len(missing_items) > 0:
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items ({match_percentage}% items matched). Please verify before approving."
+            else:
+                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity ({match_percentage}% items matched). Please verify before approving."
+        else:
+            match_status = "blocked"
+            if match_percentage == 0:
+                summary = "None of the ordered items were found in the uploaded invoice. Document appears to be for a different order."
+            else:
+                summary = f"Verification Blocked: Only {matched_items_count} of {total_ordered_items} ordered items matched ({match_percentage}%). Document appears to be for a different order or insufficient fulfillment."
 
         meta_from_parsed = parsed_invoice.get("invoice_metadata", {}) if parsed_invoice else {}
         taxable_sum = sum(r["taxable_amount"] for r in reconciled_items)
@@ -463,11 +607,17 @@ Return ONLY valid JSON matching this schema:
         }
 
         return {
-            "success": True,
+            "success": match_status != "blocked",
             "match_status": match_status,
+            "match_percentage": match_percentage,
             "summary": summary,
+            "missing_items": missing_items,
+            "extra_items": extra_items,
+            "reconciled_items": reconciled_items,
             "data": {
                 "match_status": match_status,
+                "match_percentage": match_percentage,
+                "summary": summary,
                 "invoice_metadata": invoice_metadata,
                 "reconciled_items": reconciled_items,
                 "missing_items": missing_items,
@@ -516,6 +666,20 @@ Return ONLY valid JSON matching this schema:
                 if b_code and exp_raw and str(exp_raw).upper() not in ["N/A", "NONE", "BLANK", "NULL"]:
                     batch_expiry_map[b_code] = exp_raw
 
+        # Build order item lookup for ground truth ordered quantities and IDs
+        order_items_list = order_data.get("items", [])
+        order_lookup = {}
+        for oi in order_items_list:
+            if oi.get("order_item_id") is not None:
+                order_lookup[str(oi["order_item_id"])] = oi
+            if oi.get("id") is not None:
+                order_lookup[str(oi["id"])] = oi
+            if oi.get("product_id") is not None:
+                order_lookup[str(oi["product_id"])] = oi
+            name = (oi.get("product_name") or oi.get("name") or "").upper().strip()
+            if name:
+                order_lookup[name] = oi
+
         # Ensure batches inside reconciled_items have correct fields and populated expiry
         reconciled_pids = set()
         for item in reconciled_items:
@@ -525,6 +689,21 @@ Return ONLY valid JSON matching this schema:
             oid = item.get("order_item_id")
             if oid is not None:
                 reconciled_pids.add(str(oid))
+
+            # Look up ground truth ordered quantity from order_data
+            matching_ord = (
+                order_lookup.get(str(oid)) or 
+                order_lookup.get(str(pid)) or 
+                order_lookup.get((item.get("product_name") or "").upper().strip())
+            )
+            if matching_ord:
+                ground_ord_q = self._to_float(matching_ord.get("ordered_qty") or matching_ord.get("order_qty") or matching_ord.get("quantity"))
+                if ground_ord_q > 0:
+                    item["ordered_qty"] = int(ground_ord_q) if ground_ord_q.is_integer() else ground_ord_q
+                if item.get("order_item_id") is None and matching_ord.get("order_item_id") is not None:
+                    item["order_item_id"] = matching_ord["order_item_id"]
+                if item.get("product_id") is None and matching_ord.get("product_id") is not None:
+                    item["product_id"] = matching_ord["product_id"]
 
             ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
             inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
@@ -561,49 +740,131 @@ Return ONLY valid JSON matching this schema:
                             break
             it["expiry_date"] = self._format_expiry_iso(exp_val)
 
-        # Exclude from missing_items any item that was actually fulfilled in reconciled_items
-        clean_missing = []
-        for m in missing_items:
-            m_pid = str(m.get("product_id", ""))
-            m_oid = str(m.get("order_item_id", ""))
-            if (m_pid and m_pid in reconciled_pids) or (m_oid and m_oid in reconciled_pids):
-                continue
-            if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
-                m["match_status"] = "missing"
-            clean_missing.append(m)
-        missing_items = clean_missing
+        # Cross-validate missing_items against parsed invoice line items
+        # If an item was erroneously marked missing but actually exists on invoice, recover it!
+        if parsed_invoice and parsed_invoice.get("line_items"):
+            parsed_lines = parsed_invoice.get("line_items", [])
+            clean_missing = []
+            for m in missing_items:
+                m_pid = str(m.get("product_id", ""))
+                m_oid = str(m.get("order_item_id", ""))
+                if (m_pid and m_pid in reconciled_pids) or (m_oid and m_oid in reconciled_pids):
+                    continue
+
+                matched_line = None
+                for inv_it in parsed_lines:
+                    if self._match_product(m, inv_it):
+                        matched_line = inv_it
+                        break
+
+                if matched_line:
+                    matching_ord = (
+                        order_lookup.get(m_oid) or 
+                        order_lookup.get(m_pid) or 
+                        order_lookup.get((m.get("product_name") or "").upper().strip()) or 
+                        m
+                    )
+                    ord_q = self._to_float(matching_ord.get("ordered_qty") or matching_ord.get("quantity") or matching_ord.get("order_qty"))
+                    qty = self._to_float(matched_line.get("qty") or matched_line.get("quantity"))
+                    free_q = self._to_float(matched_line.get("free") or matched_line.get("sch") or matched_line.get("free_qty"))
+                    exp_d = self._format_expiry_iso(matched_line.get("expiry") or matched_line.get("exp"))
+                    taxable = self._to_float(matched_line.get("taxable_amt") or matched_line.get("taxable_amount"))
+                    amt = self._to_float(matched_line.get("amount") or matched_line.get("net_amount"))
+                    reconciled_items.append({
+                        "order_item_id": m.get("order_item_id") or matching_ord.get("order_item_id"),
+                        "product_id": m.get("product_id") or matching_ord.get("product_id"),
+                        "product_name": m.get("product_name") or matching_ord.get("product_name"),
+                        "size": m.get("size") or matching_ord.get("size"),
+                        "match_status": "matched" if qty >= ord_q else "partial_match",
+                        "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
+                        "invoiced_qty": int(qty) if qty.is_integer() else qty,
+                        "free_qty": int(free_q) if free_q.is_integer() else free_q,
+                        "taxable_amount": round(taxable, 2),
+                        "gst_amount": round(amt - taxable if amt >= taxable else 0.0, 2),
+                        "net_amount": round(amt, 2),
+                        "batches": [{
+                            "batch_no": matched_line.get("batch") or matched_line.get("batch_no") or "N/A",
+                            "quantity": int(qty) if qty.is_integer() else qty,
+                            "free_quantity": int(free_q) if free_q.is_integer() else free_q,
+                            "expiry_date": exp_d,
+                            "match_status": "matched"
+                        }]
+                    })
+                    reconciled_pids.add(str(m.get("order_item_id", "")))
+                    reconciled_pids.add(str(m.get("product_id", "")))
+                else:
+                    if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
+                        m["match_status"] = "missing"
+                    clean_missing.append(m)
+            missing_items = clean_missing
+        else:
+            clean_missing = []
+            for m in missing_items:
+                m_pid = str(m.get("product_id", ""))
+                m_oid = str(m.get("order_item_id", ""))
+                if (m_pid and m_pid in reconciled_pids) or (m_oid and m_oid in reconciled_pids):
+                    continue
+                if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
+                    m["match_status"] = "missing"
+                clean_missing.append(m)
+            missing_items = clean_missing
 
         # Enforce exact summary format and match_status consistency
-        if len(reconciled_items) == 0:
-            match_status = "mismatched"
-            summary = "Completely incorrect invoice. No ordered items matched."
-        elif len(missing_items) == 0 and len(extra_items) == 0:
+        total_ordered_items = len(order_data.get("items", []))
+        matched_items_count = len(reconciled_items)
+
+        if total_ordered_items > 0:
+            calc_pct = round((matched_items_count / total_ordered_items) * 100, 2)
+            match_percentage = int(calc_pct) if calc_pct.is_integer() else calc_pct
+        else:
+            match_percentage = 0
+
+        # Check if quantities match for all reconciled items
+        all_quantities_fulfilled = True
+        for item in reconciled_items:
+            ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
+            inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
+            if inv_q < ord_q:
+                all_quantities_fulfilled = False
+                break
+
+        if match_percentage == 100 and all_quantities_fulfilled and len(missing_items) == 0:
             match_status = "matched"
             total_ord = sum(self._to_float(i.get("ordered_qty") or i.get("order_qty")) for i in reconciled_items)
             total_free = sum(self._to_float(i.get("free_qty")) for i in reconciled_items)
-            summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
-        elif len(missing_items) > 0 and len(extra_items) > 0:
+            if len(extra_items) > 0:
+                summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order."
+            else:
+                summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
+        elif match_percentage >= 50:
             match_status = "partial_match"
-            summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Contains {len(extra_items)} extra items not in order. Please verify before approving."
-        elif len(extra_items) > 0:
-            match_status = "partial_match"
-            summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order. Please verify before approving."
-        elif len(missing_items) > 0:
-            match_status = "partial_match"
-            summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Please verify before approving."
+            if len(missing_items) > 0 and len(extra_items) > 0:
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Contains {len(extra_items)} extra items not in order. Please verify before approving."
+            elif len(extra_items) > 0:
+                summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order. Please verify before approving."
+            elif len(missing_items) > 0:
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items ({match_percentage}% items matched). Please verify before approving."
+            else:
+                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity ({match_percentage}% items matched). Please verify before approving."
         else:
-            match_status = "partial_match"
-            summary = "Verification Mismatch: Quantities differ from ordered. Please verify before approving."
-
-        if not match_status or str(match_status).lower() in ["none", "null"]:
-            match_status = "matched" if (len(reconciled_items) > 0 and len(missing_items) == 0 and len(extra_items) == 0) else "partial_match"
+            match_status = "blocked"
+            if match_percentage == 0:
+                summary = "None of the ordered items were found in the uploaded invoice. Document appears to be for a different order."
+            else:
+                summary = f"Verification Blocked: Only {matched_items_count} of {total_ordered_items} ordered items matched ({match_percentage}%). Document appears to be for a different order or insufficient fulfillment."
 
         return {
-            "success": True,
+            "success": match_status != "blocked",
             "match_status": match_status,
+            "match_percentage": match_percentage,
             "summary": summary,
+            "missing_items": missing_items,
+            "extra_items": extra_items,
+            "reconciled_items": reconciled_items,
             "data": {
                 "match_status": match_status,
+                "match_percentage": match_percentage,
+                "summary": summary,
                 "invoice_metadata": clean_meta,
                 "reconciled_items": reconciled_items,
                 "missing_items": missing_items,
