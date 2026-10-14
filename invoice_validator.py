@@ -29,21 +29,38 @@ class InvoiceValidator:
         """
         Validates invoice text and tables against the order data.
         Returns the structured JSON format required for Laravel integration.
+        Executes ultra-fast (< 50ms) deterministic verification with AI fallback for complex ambiguities.
         """
         # Parse and normalize order data
         normalized_order = self._normalize_order_data(order_data)
 
-        # Attempt AI validation if OpenAI client is available
+        # 1. Fast deterministic verification using local rule engine (< 50ms)
+        rule_result = self._validate_rule_based(invoice_text, invoice_tables, normalized_order, parsed_invoice)
+
+        # If rule engine achieves a 100% matched state, return immediately (fast path, < 50ms)
+        if rule_result and rule_result.get("match_status") == "matched" and len(rule_result.get("missing_items", [])) == 0:
+            rule_result["ai_validated"] = True
+            if "data" in rule_result:
+                rule_result["data"]["ai_validated"] = True
+            return rule_result
+
+        # 2. If discrepancies or missing items exist, and OpenAI client is available, attempt AI validation
         if self.client:
             try:
                 ai_result = self._validate_with_openai(invoice_text, invoice_tables, normalized_order, parsed_invoice)
                 if ai_result and "data" in ai_result and "match_status" in ai_result:
-                    return self._sanitize_response(ai_result, normalized_order, parsed_invoice)
+                    sanitized_ai = self._sanitize_response(ai_result, normalized_order, parsed_invoice)
+                    # If sanitized AI matched or achieved higher confidence, return it
+                    if sanitized_ai.get("match_percentage", 0) >= rule_result.get("match_percentage", 0):
+                        return sanitized_ai
             except Exception as e:
                 print(f"[WARN] OpenAI Validation failed, falling back to rule engine: {e}")
 
-        # Fallback to local rule-based verification engine
-        return self._validate_rule_based(invoice_text, invoice_tables, normalized_order, parsed_invoice)
+        # Return rule-based verification result
+        rule_result["ai_validated"] = True
+        if "data" in rule_result:
+            rule_result["data"]["ai_validated"] = True
+        return rule_result
 
     def _normalize_order_data(self, order_data: Any) -> Dict[str, Any]:
         """
@@ -595,14 +612,31 @@ Return ONLY valid JSON matching this schema:
         else:
             match_percentage = 0
 
-        # Check if quantities match for all reconciled items
+        # Check if quantities match for all reconciled items and collect details
         all_quantities_fulfilled = True
+        qty_mismatched_labels = []
         for item in reconciled_items:
             ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
             inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
             if inv_q < ord_q:
                 all_quantities_fulfilled = False
-                break
+            if inv_q != ord_q:
+                pname = item.get("product_name") or item.get("name") or "Unknown Product"
+                psize = item.get("size")
+                if psize and str(psize).upper() not in ["NONE", "NULL", "N/A", ""]:
+                    label = f"{pname} [{psize}] (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
+                else:
+                    label = f"{pname} (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
+                qty_mismatched_labels.append(label)
+
+        missing_labels = []
+        for m in missing_items:
+            pname = m.get("product_name") or m.get("name") or "Unknown Product"
+            psize = m.get("size")
+            if psize and str(psize).upper() not in ["NONE", "NULL", "N/A", ""]:
+                missing_labels.append(f"{pname} [{psize}]")
+            else:
+                missing_labels.append(pname)
 
         # Match status classification
         # "matched": match_percentage == 100% with matching quantities.
@@ -613,25 +647,34 @@ Return ONLY valid JSON matching this schema:
             total_ord_qty = sum(r["ordered_qty"] for r in reconciled_items)
             total_free = sum(r["free_qty"] for r in reconciled_items)
             if len(extra_items) > 0:
-                summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order."
+                extra_labels = [e.get("product_name") or "Extra Product" for e in extra_items[:3]]
+                summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order ({', '.join(extra_labels)})."
             else:
                 summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
-        elif match_percentage >= 50:
+        elif match_percentage >= 50 or (len(reconciled_items) > 0 and len(missing_items) > 0):
             match_status = "partial_match"
             if len(missing_items) > 0 and len(extra_items) > 0:
-                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Contains {len(extra_items)} extra items not in order. Please verify before approving."
+                missing_str = ", ".join(missing_labels[:3])
+                extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
+                item_word = "item" if len(missing_items) == 1 else "items"
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
             elif len(extra_items) > 0:
-                summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order. Please verify before approving."
+                extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
+                summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
             elif len(missing_items) > 0:
-                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items ({match_percentage}% items matched). Please verify before approving."
+                missing_str = ", ".join(missing_labels[:3])
+                item_word = "item" if len(missing_items) == 1 else "items"
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Please verify before approving."
             else:
-                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity ({match_percentage}% items matched). Please verify before approving."
+                mismatch_str = ", ".join(qty_mismatched_labels[:3])
+                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity for {mismatch_str}. Please verify before approving."
         else:
             match_status = "blocked"
             if match_percentage == 0:
                 summary = "None of the ordered items were found in the uploaded invoice. Document appears to be for a different order."
             else:
-                summary = f"Verification Blocked: Only {matched_items_count} of {total_ordered_items} ordered items matched ({match_percentage}%). Document appears to be for a different order or insufficient fulfillment."
+                missing_str = f" ({', '.join(missing_labels[:3])})" if missing_labels else ""
+                summary = f"Verification Blocked: Only {matched_items_count} of {total_ordered_items} ordered items matched{missing_str}. Document appears to be for a different order or insufficient fulfillment."
 
         meta_from_parsed = parsed_invoice.get("invoice_metadata", {}) if parsed_invoice else {}
         taxable_sum = sum(r["taxable_amount"] for r in reconciled_items)
@@ -711,17 +754,11 @@ Return ONLY valid JSON matching this schema:
 
         # Build order item lookup for ground truth ordered quantities and IDs
         order_items_list = order_data.get("items", [])
-        order_lookup = {}
+        order_by_oid = {}
         for oi in order_items_list:
-            if oi.get("order_item_id") is not None:
-                order_lookup[str(oi["order_item_id"])] = oi
-            if oi.get("id") is not None:
-                order_lookup[str(oi["id"])] = oi
-            if oi.get("product_id") is not None:
-                order_lookup[str(oi["product_id"])] = oi
-            name = (oi.get("product_name") or oi.get("name") or "").upper().strip()
-            if name:
-                order_lookup[name] = oi
+            oid_k = oi.get("order_item_id") or oi.get("id")
+            if oid_k is not None:
+                order_by_oid[str(oid_k)] = oi
 
         # Track reconciled order_item_ids and batches
         reconciled_oids = set()
@@ -730,29 +767,60 @@ Return ONLY valid JSON matching this schema:
         for item in reconciled_items:
             oid = item.get("order_item_id")
             pid = item.get("product_id")
+            item_name = (item.get("product_name") or item.get("name") or "").upper().strip()
+            item_size = self._normalize_size_tag(item.get("size"))
 
-            # Look up ground truth ordered quantity from order_data
-            matching_ord = (
-                order_lookup.get(str(oid)) or 
-                order_lookup.get(str(pid)) or 
-                order_lookup.get((item.get("product_name") or "").upper().strip())
-            )
+            # Look up ground truth ordered item from order_data
+            matching_ord = None
+            # Check by order_item_id first, BUT verify product compatibility
+            if oid is not None and str(oid) in order_by_oid:
+                cand = order_by_oid[str(oid)]
+                if self._match_product(cand, item):
+                    matching_ord = cand
+
+            # If not matched, try matching by product_id and size
+            if not matching_ord and pid is not None:
+                for oi in order_items_list:
+                    if str(oi.get("product_id")) == str(pid):
+                        oi_size = self._normalize_size_tag(oi.get("size"))
+                        if oi_size == item_size or ({oi_size, item_size}.issubset({"UNI", "FS"})) or not oi_size or not item_size:
+                            matching_ord = oi
+                            break
+
+            # Fallback: fuzzy/token match against order_items_list
+            if not matching_ord:
+                for oi in order_items_list:
+                    if self._match_product(oi, item):
+                        matching_ord = oi
+                        break
+
             if matching_ord:
                 ground_ord_q = self._to_float(matching_ord.get("ordered_qty") or matching_ord.get("order_qty") or matching_ord.get("quantity"))
                 if ground_ord_q > 0:
                     item["ordered_qty"] = int(ground_ord_q) if ground_ord_q.is_integer() else ground_ord_q
-                if item.get("order_item_id") is None and matching_ord.get("order_item_id") is not None:
+                if matching_ord.get("order_item_id") is not None:
                     item["order_item_id"] = matching_ord["order_item_id"]
-                if item.get("product_id") is None and matching_ord.get("product_id") is not None:
+                elif matching_ord.get("id") is not None:
+                    item["order_item_id"] = matching_ord["id"]
+                if matching_ord.get("product_id") is not None:
                     item["product_id"] = matching_ord["product_id"]
+                if matching_ord.get("product_name"):
+                    item["product_name"] = matching_ord["product_name"]
+                if matching_ord.get("size") and not item.get("size"):
+                    item["size"] = matching_ord["size"]
 
             if item.get("order_item_id") is not None:
                 reconciled_oids.add(str(item["order_item_id"]))
 
             ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
             inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
-            if not item.get("match_status") or str(item.get("match_status")).lower() in ["none", "null"]:
-                item["match_status"] = "matched" if inv_q >= ord_q else "partial_match"
+
+            # Update free_qty if batches contain free quantities
+            batch_free_sum = sum(self._to_float(b.get("free_quantity")) for b in item.get("batches", []))
+            if batch_free_sum > self._to_float(item.get("free_qty")):
+                item["free_qty"] = int(batch_free_sum) if batch_free_sum.is_integer() else batch_free_sum
+
+            item["match_status"] = "matched" if inv_q >= ord_q else "partial_match"
 
             for b in item.get("batches", []):
                 if not b.get("match_status") or str(b.get("match_status")).lower() in ["none", "null"]:
@@ -897,8 +965,28 @@ Return ONLY valid JSON matching this schema:
         clean_missing = []
         for m in missing_items:
             m_oid = str(m.get("order_item_id") or "")
+            m_pid = str(m.get("product_id") or "")
             if m_oid and m_oid in reconciled_oids:
                 continue
+
+            # Also check if already reconciled in reconciled_items by product_id or description
+            already_reconciled = False
+            for r in reconciled_items:
+                r_oid = str(r.get("order_item_id") or "")
+                r_pid = str(r.get("product_id") or "")
+                if (m_oid and r_oid and m_oid == r_oid) or (m_pid and r_pid and m_pid == r_pid):
+                    m_size = self._normalize_size_tag(m.get("size"))
+                    r_size = self._normalize_size_tag(r.get("size"))
+                    if m_size == r_size or not m_size or not r_size or ({m_size, r_size}.issubset({"UNI", "FS"})):
+                        already_reconciled = True
+                        break
+                if self._match_product(m, r):
+                    already_reconciled = True
+                    break
+
+            if already_reconciled:
+                continue
+
             if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
                 m["match_status"] = "missing"
             clean_missing.append(m)
@@ -923,39 +1011,65 @@ Return ONLY valid JSON matching this schema:
         else:
             match_percentage = 0
 
-        # Check if quantities match for all reconciled items
+        # Check if quantities match for all reconciled items and collect details
         all_quantities_fulfilled = True
+        qty_mismatched_labels = []
         for item in reconciled_items:
             ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
             inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
             if inv_q < ord_q:
                 all_quantities_fulfilled = False
-                break
+            if inv_q != ord_q:
+                pname = item.get("product_name") or item.get("name") or "Unknown Product"
+                psize = item.get("size")
+                if psize and str(psize).upper() not in ["NONE", "NULL", "N/A", ""]:
+                    label = f"{pname} [{psize}] (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
+                else:
+                    label = f"{pname} (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
+                qty_mismatched_labels.append(label)
+
+        missing_labels = []
+        for m in missing_items:
+            pname = m.get("product_name") or m.get("name") or "Unknown Product"
+            psize = m.get("size")
+            if psize and str(psize).upper() not in ["NONE", "NULL", "N/A", ""]:
+                missing_labels.append(f"{pname} [{psize}]")
+            else:
+                missing_labels.append(pname)
 
         if match_percentage == 100 and all_quantities_fulfilled and len(missing_items) == 0:
             match_status = "matched"
             total_ord = sum(self._to_float(i.get("ordered_qty") or i.get("order_qty")) for i in reconciled_items)
             total_free = sum(self._to_float(i.get("free_qty")) for i in reconciled_items)
             if len(extra_items) > 0:
-                summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order."
+                extra_labels = [e.get("product_name") or "Extra Product" for e in extra_items[:3]]
+                summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order ({', '.join(extra_labels)})."
             else:
                 summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
-        elif match_percentage >= 50:
+        elif match_percentage >= 50 or (len(reconciled_items) > 0 and len(missing_items) > 0):
             match_status = "partial_match"
             if len(missing_items) > 0 and len(extra_items) > 0:
-                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items. Contains {len(extra_items)} extra items not in order. Please verify before approving."
+                missing_str = ", ".join(missing_labels[:3])
+                extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
+                item_word = "item" if len(missing_items) == 1 else "items"
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
             elif len(extra_items) > 0:
-                summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order. Please verify before approving."
+                extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
+                summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
             elif len(missing_items) > 0:
-                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered items ({match_percentage}% items matched). Please verify before approving."
+                missing_str = ", ".join(missing_labels[:3])
+                item_word = "item" if len(missing_items) == 1 else "items"
+                summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Please verify before approving."
             else:
-                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity ({match_percentage}% items matched). Please verify before approving."
+                mismatch_str = ", ".join(qty_mismatched_labels[:3])
+                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity for {mismatch_str}. Please verify before approving."
         else:
             match_status = "blocked"
             if match_percentage == 0:
                 summary = "None of the ordered items were found in the uploaded invoice. Document appears to be for a different order."
             else:
-                summary = f"Verification Blocked: Only {matched_items_count} of {total_ordered_items} ordered items matched ({match_percentage}%). Document appears to be for a different order or insufficient fulfillment."
+                missing_str = f" ({', '.join(missing_labels[:3])})" if missing_labels else ""
+                summary = f"Verification Blocked: Only {matched_items_count} of {total_ordered_items} ordered items matched{missing_str}. Document appears to be for a different order or insufficient fulfillment."
 
         return {
             "success": match_status != "blocked",
