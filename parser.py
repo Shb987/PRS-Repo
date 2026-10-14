@@ -314,7 +314,7 @@ class InvoiceParser:
     @staticmethod
     def _normalize_size(size_str: Optional[str]) -> Optional[str]:
         """
-        Normalizes size tags into standard variants (S, M, L, XL, XXL, XXXL, XS, FS).
+        Normalizes size tags into standard variants (S, M, L, XL, XXL, XXXL, XS, FS, UNI).
         """
         if not size_str:
             return None
@@ -327,29 +327,32 @@ class InvoiceParser:
             "LARGE": "L",
             "EXTRALARGE": "XL",
             "FREESIZE": "FS",
-            "FREE": "FS"
+            "FREE": "FS",
+            "UNIVERSAL": "UNI",
+            "UNI": "UNI",
+            "UNISEX": "UNI"
         }
         return mapping.get(s, s)
 
     @staticmethod
     def _extract_size_tag(text: str) -> Optional[str]:
         """
-        Extracts size tags from text (e.g. [L], [M], [S], (XL), SIZE L, - L).
+        Extracts size tags from text (e.g. [L], [M], [S], (XL), SIZE L, - L, UNI, UNIVERSAL).
         """
         if not text:
             return None
-        # 1. Bracketed tags like [L], [M], [S], [XL], [XXL], [XXXL], [XS], (L), (M), etc.
-        m_bracket = re.search(r'[\[\(\{]\s*(XXXL|XXL|2XL|3XL|XL|XS|S|M|L|FREE\s*SIZE|FS)\s*[\]\)\}]', text, re.IGNORECASE)
+        # 1. Bracketed tags like [L], [M], [S], [XL], [XXL], [XXXL], [XS], (L), (M), [UNI], etc.
+        m_bracket = re.search(r'[\[\(\{]\s*(XXXL|XXL|2XL|3XL|XL|XS|S|M|L|FREE\s*SIZE|FS|UNI(?:VERSAL)?)\s*[\]\)\}]', text, re.IGNORECASE)
         if m_bracket:
             return InvoiceParser._normalize_size(m_bracket.group(1))
 
-        # 2. Explicit SIZE prefix: SIZE L, SIZE: M, SZ: XL
-        m_explicit = re.search(r'\b(?:SIZE|SZ)[:\s-]+(XXXL|XXL|2XL|3XL|XL|XS|S|M|L)\b', text, re.IGNORECASE)
+        # 2. Explicit SIZE prefix: SIZE L, SIZE: M, SZ: XL, SIZE: UNI
+        m_explicit = re.search(r'\b(?:SIZE|SZ)[:\s-]+(XXXL|XXL|2XL|3XL|XL|XS|S|M|L|FREE\s*SIZE|FS|UNI(?:VERSAL)?)\b', text, re.IGNORECASE)
         if m_explicit:
             return InvoiceParser._normalize_size(m_explicit.group(1))
 
-        # 3. Delimited trailing/isolated size tag: e.g. " - L", " / M"
-        m_delim = re.search(r'(?:^|[\s\-_/])(XXXL|XXL|2XL|3XL|XL|XS|S|M|L)(?:\s*$|[\s\-_/,])', text, re.IGNORECASE)
+        # 3. Delimited trailing/isolated size tag: e.g. " - L", " / M", " UNI"
+        m_delim = re.search(r'(?:^|[\s\-_/])(XXXL|XXL|2XL|3XL|XL|XS|S|M|L|UNI(?:VERSAL)?)(?:\s*$|[\s\-_/,])', text, re.IGNORECASE)
         if m_delim:
             return InvoiceParser._normalize_size(m_delim.group(1))
 
@@ -531,19 +534,24 @@ class InvoiceParser:
 
                         item["expiry"] = verified_exp if verified_exp else "N/A"
 
-                        # Extract product code if not in dedicated column
-                        if item.get("p_code", "N/A") in ["N/A", "", None]:
-                            extracted_p_code = InvoiceParser._extract_product_code(item.get("description", ""))
-                            if extracted_p_code:
-                                item["p_code"] = extracted_p_code
+                        # Extract product code if not in dedicated column or if current p_code is a truncated prefix
+                        extracted_p_code = InvoiceParser._extract_product_code(item.get("description", ""))
+                        cur_p_code = str(item.get("p_code", "N/A")).strip()
+                        if extracted_p_code and (
+                            cur_p_code in ["N/A", "", "None", None]
+                            or cur_p_code.endswith("-")
+                            or len(cur_p_code) < len(extracted_p_code)
+                        ):
+                            item["p_code"] = extracted_p_code
+                        elif cur_p_code in ["N/A", "", "None", None] and extracted_p_code:
+                            item["p_code"] = extracted_p_code
 
                         # Extract size tag if not in dedicated column
-                        if item.get("size", "N/A") in ["N/A", "", None]:
-                            extracted_size = InvoiceParser._extract_size_tag(item.get("description", ""))
-                            if not extracted_size and item.get("p_code", "N/A") != "N/A":
-                                extracted_size = InvoiceParser._extract_size_tag(item.get("p_code", ""))
-                            if extracted_size:
-                                item["size"] = extracted_size
+                        extracted_size = InvoiceParser._extract_size_tag(item.get("description", ""))
+                        if not extracted_size and item.get("p_code", "N/A") != "N/A":
+                            extracted_size = InvoiceParser._extract_size_tag(item.get("p_code", ""))
+                        if extracted_size and item.get("size", "N/A") in ["N/A", "", "None", None]:
+                            item["size"] = extracted_size
 
                         if item.get("description", "N/A") != "N/A":
                             extracted_items.append(item)
@@ -610,19 +618,24 @@ class InvoiceParser:
 
                     item["expiry"] = verified_exp if verified_exp else "N/A"
 
-                    # Extract product code if not in dedicated column
-                    if item.get("p_code", "N/A") in ["N/A", "", None]:
-                        extracted_p_code = InvoiceParser._extract_product_code(item.get("description", ""))
-                        if extracted_p_code:
-                            item["p_code"] = extracted_p_code
+                    # Extract product code if not in dedicated column or if current p_code is a truncated prefix
+                    extracted_p_code = InvoiceParser._extract_product_code(item.get("description", ""))
+                    cur_p_code = str(item.get("p_code", "N/A")).strip()
+                    if extracted_p_code and (
+                        cur_p_code in ["N/A", "", "None", None]
+                        or cur_p_code.endswith("-")
+                        or len(cur_p_code) < len(extracted_p_code)
+                    ):
+                        item["p_code"] = extracted_p_code
+                    elif cur_p_code in ["N/A", "", "None", None] and extracted_p_code:
+                        item["p_code"] = extracted_p_code
 
                     # Extract size tag if not in dedicated column
-                    if item.get("size", "N/A") in ["N/A", "", None]:
-                        extracted_size = InvoiceParser._extract_size_tag(item.get("description", ""))
-                        if not extracted_size and item.get("p_code", "N/A") != "N/A":
-                            extracted_size = InvoiceParser._extract_size_tag(item.get("p_code", ""))
-                        if extracted_size:
-                            item["size"] = extracted_size
+                    extracted_size = InvoiceParser._extract_size_tag(item.get("description", ""))
+                    if not extracted_size and item.get("p_code", "N/A") != "N/A":
+                        extracted_size = InvoiceParser._extract_size_tag(item.get("p_code", ""))
+                    if extracted_size and item.get("size", "N/A") in ["N/A", "", "None", None]:
+                        item["size"] = extracted_size
 
                     if item.get("description", "N/A") != "N/A":
                         extracted_items.append(item)

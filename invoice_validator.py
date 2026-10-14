@@ -132,7 +132,10 @@ class InvoiceValidator:
             "LARGE": "L",
             "EXTRALARGE": "XL",
             "FREESIZE": "FS",
-            "FREE": "FS"
+            "FREE": "FS",
+            "UNI": "UNI",
+            "UNIVERSAL": "UNI",
+            "UNISEX": "UNI"
         }
         return mapping.get(s, s)
 
@@ -152,9 +155,9 @@ class InvoiceValidator:
         Determines whether an invoice line item matches an ordered product variant.
         Handles:
         - Product code recognition (e.g. AS-D23, BP-05) both in dedicated columns and embedded in descriptions.
-        - Size variant tags (e.g. [L], [M], [S], (XL), XXL) with strict variant preservation.
+        - Size variant tags (e.g. [L], [M], [S], (XL), XXL, UNI, FS) with strict variant preservation.
         - Side variants (LEFT, RIGHT).
-        - Substring and token matching for product descriptions.
+        - Substring and token matching for product descriptions with specific category preservation.
         """
         order_name = (order_item.get("product_name") or order_item.get("name") or "").upper().strip()
         inv_desc = (inv_item.get("description") or inv_item.get("item_name") or "").upper().strip()
@@ -202,19 +205,23 @@ class InvoiceValidator:
         # --- VARIANT COMPATIBILITY CHECKS ---
         # A. Size Variant Conflict: If both specify a size and they differ -> Mismatch!
         if norm_ord_size and norm_inv_size and norm_ord_size != norm_inv_size:
-            return False
+            if not ({norm_ord_size, norm_inv_size}.issubset({"UNI", "FS"})):
+                return False
 
         # If order specifies size, but invoice didn't explicitly extract one, check if inv_desc has conflicting size
         if norm_ord_size and not norm_inv_size:
-            detected_inv_size = cls._extract_size_tag(inv_desc)
+            detected_inv_size = cls._normalize_size_tag(cls._extract_size_tag(inv_desc))
             if detected_inv_size and detected_inv_size != norm_ord_size:
-                return False
+                if not ({norm_ord_size, detected_inv_size}.issubset({"UNI", "FS"})):
+                    return False
 
         # If invoice specifies size, but order didn't, check if order_name has conflicting size
         if norm_inv_size and not norm_ord_size:
-            detected_ord_size = cls._extract_size_tag(order_name)
-            if detected_ord_size and detected_ord_size != norm_inv_size:
-                return False
+            if norm_inv_size not in ["UNI", "FS"]:
+                detected_ord_size = cls._normalize_size_tag(cls._extract_size_tag(order_name))
+                if detected_ord_size and detected_ord_size != norm_inv_size:
+                    if not ({norm_inv_size, detected_ord_size}.issubset({"UNI", "FS"})):
+                        return False
 
         # B. Side Variant Conflict (LEFT vs RIGHT)
         if order_side in ["LEFT", "RIGHT"] and inv_side in ["LEFT", "RIGHT"]:
@@ -225,12 +232,42 @@ class InvoiceValidator:
             if re.search(r'\b' + opp_side + r'\b', inv_desc):
                 return False
 
+        # C. Distinct Orthopedic Category Conflict: "BRACE" vs "CAP"
+        has_brace_ord = "BRACE" in order_name
+        has_brace_inv = "BRACE" in inv_desc
+        if has_brace_ord != has_brace_inv:
+            return False
+
+        # D. "AIR PRO" distinction: if order specifies AIR or PRO, invoice must have it;
+        # if order does not specify AIR PRO, invoice must not be an AIR PRO variant
+        has_air_pro_ord = ("AIR" in order_name and "PRO" in order_name) or ("ASD23" in (norm_ord_code or ""))
+        has_air_pro_inv = ("AIR" in inv_desc and "PRO" in inv_desc) or ("ASD23" in (norm_inv_code or ""))
+        if has_air_pro_ord != has_air_pro_inv:
+            return False
+
+        # E. Distinct Anatomy / Body Part Conflict (e.g. KNEE vs BOUFFANT, ELBOW vs ARM, etc.)
+        clean_ord_tokens = set(re.findall(r'[A-Z0-9]+', order_name))
+        clean_inv_tokens = set(re.findall(r'[A-Z0-9]+', inv_desc))
+
+        anatomy_tokens = {
+            "KNEE", "ELBOW", "WRIST", "ANKLE", "THUMB", "ARM", "SHOULDER",
+            "CERVICAL", "LUMBAR", "ABDOMINAL", "CHEST", "FINGER", "FOOT", "LEG", "CALF", "THIGH"
+        }
+        ord_anatomy = {t for t in clean_ord_tokens if t in anatomy_tokens}
+        inv_anatomy = {t for t in clean_inv_tokens if t in anatomy_tokens}
+        if ord_anatomy and not (ord_anatomy & inv_anatomy):
+            return False
+        if inv_anatomy and not ord_anatomy:
+            return False
+
         # --- PRODUCT CODE MATCHING ---
-        # If BOTH have product codes:
         if norm_ord_code and norm_inv_code:
             if norm_ord_code == norm_inv_code:
                 # Matching product codes + matching sizes = definite match!
                 return True
+            elif norm_ord_code in norm_inv_code or norm_inv_code in norm_ord_code:
+                # Prefix/substring match (e.g. ASD vs ASD04, or AS-H vs AS-H06), allow token verification
+                pass
             else:
                 # Distinct explicit product codes (e.g. AS-D23 vs BP-05) -> Not the same product
                 return False
@@ -248,14 +285,12 @@ class InvoiceValidator:
                 return True
 
         # --- DESCRIPTIVE TOKEN & FUZZY MATCHING ---
-        clean_ord_tokens = set(re.findall(r'[A-Z0-9]+', order_name))
-        clean_inv_tokens = set(re.findall(r'[A-Z0-9]+', inv_desc))
 
         # Filter out generic pharmaceutical descriptors and size tokens from token set
         generic_tokens = {
-            "ITEM", "ITEMS", "PRODUCT", "PRODUCTS", "MEDICINE", "TAB", "TABLET", "CAP", "CAPSULE",
-            "SYRUP", "INJ", "INJECTION", "PRO", "AIR", "PAIR", "THE", "AND", "OF", "MG", "ML", "GM",
-            "NOS", "BOX", "STRIP", "PACK", "S", "M", "L", "XL", "XXL", "XXXL", "XS"
+            "ITEM", "ITEMS", "PRODUCT", "PRODUCTS", "MEDICINE", "TAB", "TABLET", "CAPSULE",
+            "SYRUP", "INJ", "INJECTION", "THE", "AND", "OF", "MG", "ML", "GM",
+            "NOS", "BOX", "STRIP", "PACK", "S", "M", "L", "XL", "XXL", "XXXL", "XS", "UNI", "FS"
         }
         core_tokens = [t for t in clean_ord_tokens if t not in generic_tokens]
 
@@ -312,19 +347,25 @@ Order Items:
    - "partial_match": match_percentage >= 50% (at least half the ordered products exist on the invoice, or all exist but quantities differ).
    - "blocked": match_percentage < 50% or 0% (document appears to be for a different order or insufficient fulfillment).
    - IMPORTANT: If an item is partially fulfilled (e.g. ordered 10, invoiced 4), place it in `reconciled_items` with match_status="partial_match". Do NOT place partially fulfilled items in `missing_items`. `missing_items` is strictly for products with 0 units on the invoice.
-2. `batches` Array per Item:
+   - CRITICAL COMPREHENSIVENESS: Every single item in the Order Items list MUST be accounted for in either `reconciled_items` (if present on the invoice) OR `missing_items` (if genuinely absent). Do NOT omit any ordered item.
+2. Product & Variant Matching Guidelines:
+   - Match item descriptions, variant sizes (S, M, L, XL, UNI/FS), and product model codes (e.g., 'AS-D23 KNEE CAP AIR PRO L' fulfills 'KNEE CAP AIR PRO' size 'L'; 'AS-D24 HINGED KNEE BRACE UNI' fulfills 'HINGED KNEE BRACE' [UNI/Universal]; 'ASD-04 KNEE CAP(PAIR) M' fulfills 'KNEE CAP' size 'M'; 'ASD-04 KNEE CAP PAIR L' fulfills 'KNEE CAP' size 'L').
+   - Keep distinct variants separate (e.g., size M and size L are distinct items with their own order_item_id).
+   - 'UNI', 'UNIVERSAL', or 'FS' denotes Universal / Free Size.
+   - Preserve the exact `order_item_id` and `product_id` from the Order Details.
+3. `batches` Array per Item:
    When an item is fulfilled using multiple batches (e.g. 12 in ASKCM1225 and 8 in KCM02261), group them in that item's `batches` array rather than returning disconnected line items.
-3. `invoiced_qty`:
+4. `invoiced_qty`:
    Sum of all paid quantities for that item across its batches.
-4. `free_qty`:
+5. `free_qty`:
    Sum of all free quantities for that item across its batches.
-5. `missing_items`:
+6. `missing_items`:
    Any ordered product not found on the invoice. Do NOT put items here if they appear on the invoice.
-6. `extra_items`:
+7. `extra_items`:
    Any product printed on the invoice that was not in the original order.
-7. `expiry_date` in `batches`:
+8. `expiry_date` in `batches`:
    ALWAYS extract the batch expiration date from PRE-PARSED INVOICE DATA (field 'expiry') or tables/text. Convert month/year formats like "01/31" into standard ISO "YYYY-MM-DD" (e.g. "2031-01-31", "02/31" -> "2031-02-28", "06/30" -> "2030-06-30"). Never return null when an expiry date is present in the invoice or pre-parsed data.
-8. `summary`:
+9. `summary`:
    - If blocked (0%): "None of the ordered items were found in the uploaded invoice. Document appears to be for a different order."
    - If blocked (< 50%): "Verification Blocked: Only <N> of <T> ordered items matched (<P>%). Document appears to be for a different order."
    - If matched: "All <N> ordered items matched across <V> variants with <F> free units fulfilled."
@@ -452,7 +493,7 @@ Return ONLY valid JSON matching this schema:
             prod_id = ord_item.get("product_id") or ord_item.get("id")
             prod_name = ord_item.get("product_name") or ord_item.get("name", "")
             size = ord_item.get("size") or ord_item.get("variant_label")
-            ordered_qty = self._to_float(ord_item.get("order_qty") or ord_item.get("quantity"))
+            ordered_qty = self._to_float(ord_item.get("ordered_qty") or ord_item.get("order_qty") or ord_item.get("quantity"))
 
             matched_batches = []
             item_taxable = 0.0
@@ -462,6 +503,8 @@ Return ONLY valid JSON matching this schema:
             total_free_qty = 0.0
 
             for idx, inv_item in enumerate(line_items):
+                if idx in matched_inv_indices:
+                    continue
                 if self._match_product(ord_item, inv_item):
                     matched_inv_indices.add(idx)
                     b_no = inv_item.get("batch") or inv_item.get("batch_no") or "N/A"
@@ -680,15 +723,13 @@ Return ONLY valid JSON matching this schema:
             if name:
                 order_lookup[name] = oi
 
-        # Ensure batches inside reconciled_items have correct fields and populated expiry
-        reconciled_pids = set()
+        # Track reconciled order_item_ids and batches
+        reconciled_oids = set()
+        reconciled_batches = set()
+
         for item in reconciled_items:
-            pid = item.get("product_id")
-            if pid is not None:
-                reconciled_pids.add(str(pid))
             oid = item.get("order_item_id")
-            if oid is not None:
-                reconciled_pids.add(str(oid))
+            pid = item.get("product_id")
 
             # Look up ground truth ordered quantity from order_data
             matching_ord = (
@@ -705,6 +746,9 @@ Return ONLY valid JSON matching this schema:
                 if item.get("product_id") is None and matching_ord.get("product_id") is not None:
                     item["product_id"] = matching_ord["product_id"]
 
+            if item.get("order_item_id") is not None:
+                reconciled_oids.add(str(item["order_item_id"]))
+
             ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
             inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
             if not item.get("match_status") or str(item.get("match_status")).lower() in ["none", "null"]:
@@ -713,8 +757,10 @@ Return ONLY valid JSON matching this schema:
             for b in item.get("batches", []):
                 if not b.get("match_status") or str(b.get("match_status")).lower() in ["none", "null"]:
                     b["match_status"] = "matched"
-                exp_val = b.get("expiry_date")
                 b_no = (b.get("batch_no") or "").strip().upper()
+                if b_no and b_no != "N/A":
+                    reconciled_batches.add(b_no)
+                exp_val = b.get("expiry_date")
                 if not exp_val or str(exp_val).upper() in ["N/A", "NONE", "NULL", "BLANK", ""]:
                     if b_no in batch_expiry_map:
                         exp_val = batch_expiry_map[b_no]
@@ -740,74 +786,132 @@ Return ONLY valid JSON matching this schema:
                             break
             it["expiry_date"] = self._format_expiry_iso(exp_val)
 
-        # Cross-validate missing_items against parsed invoice line items
-        # If an item was erroneously marked missing but actually exists on invoice, recover it!
-        if parsed_invoice and parsed_invoice.get("line_items"):
-            parsed_lines = parsed_invoice.get("line_items", [])
-            clean_missing = []
-            for m in missing_items:
-                m_pid = str(m.get("product_id", ""))
-                m_oid = str(m.get("order_item_id", ""))
-                if (m_pid and m_pid in reconciled_pids) or (m_oid and m_oid in reconciled_pids):
-                    continue
+        # Ensure 100% order item accountability: Check ALL items in the original order
+        parsed_lines = parsed_invoice.get("line_items", []) if parsed_invoice else []
+        for oi in order_items_list:
+            oid = str(oi.get("order_item_id") or oi.get("id") or "")
+            if oid and oid in reconciled_oids:
+                continue
 
-                matched_line = None
-                for inv_it in parsed_lines:
-                    if self._match_product(m, inv_it):
-                        matched_line = inv_it
-                        break
+            ord_q = self._to_float(oi.get("ordered_qty") or oi.get("order_qty") or oi.get("quantity"))
+            ord_name = oi.get("product_name") or oi.get("name") or ""
+            ord_pid = oi.get("product_id") or oi.get("id")
+            ord_size = oi.get("size") or oi.get("variant_label")
 
-                if matched_line:
-                    matching_ord = (
-                        order_lookup.get(m_oid) or 
-                        order_lookup.get(m_pid) or 
-                        order_lookup.get((m.get("product_name") or "").upper().strip()) or 
-                        m
-                    )
-                    ord_q = self._to_float(matching_ord.get("ordered_qty") or matching_ord.get("quantity") or matching_ord.get("order_qty"))
-                    qty = self._to_float(matched_line.get("qty") or matched_line.get("quantity"))
-                    free_q = self._to_float(matched_line.get("free") or matched_line.get("sch") or matched_line.get("free_qty"))
-                    exp_d = self._format_expiry_iso(matched_line.get("expiry") or matched_line.get("exp"))
-                    taxable = self._to_float(matched_line.get("taxable_amt") or matched_line.get("taxable_amount"))
-                    amt = self._to_float(matched_line.get("amount") or matched_line.get("net_amount"))
-                    reconciled_items.append({
-                        "order_item_id": m.get("order_item_id") or matching_ord.get("order_item_id"),
-                        "product_id": m.get("product_id") or matching_ord.get("product_id"),
-                        "product_name": m.get("product_name") or matching_ord.get("product_name"),
-                        "size": m.get("size") or matching_ord.get("size"),
-                        "match_status": "matched" if qty >= ord_q else "partial_match",
-                        "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
-                        "invoiced_qty": int(qty) if qty.is_integer() else qty,
-                        "free_qty": int(free_q) if free_q.is_integer() else free_q,
-                        "taxable_amount": round(taxable, 2),
-                        "gst_amount": round(amt - taxable if amt >= taxable else 0.0, 2),
-                        "net_amount": round(amt, 2),
-                        "batches": [{
-                            "batch_no": matched_line.get("batch") or matched_line.get("batch_no") or "N/A",
-                            "quantity": int(qty) if qty.is_integer() else qty,
-                            "free_quantity": int(free_q) if free_q.is_integer() else free_q,
-                            "expiry_date": exp_d,
-                            "match_status": "matched"
-                        }]
-                    })
-                    reconciled_pids.add(str(m.get("order_item_id", "")))
-                    reconciled_pids.add(str(m.get("product_id", "")))
-                else:
-                    if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
-                        m["match_status"] = "missing"
-                    clean_missing.append(m)
-            missing_items = clean_missing
-        else:
-            clean_missing = []
-            for m in missing_items:
-                m_pid = str(m.get("product_id", ""))
-                m_oid = str(m.get("order_item_id", ""))
-                if (m_pid and m_pid in reconciled_pids) or (m_oid and m_oid in reconciled_pids):
+            # A. Check if the ordered item was falsely placed in extra_items
+            matched_extra_idx = -1
+            for e_idx, ex in enumerate(extra_items):
+                if self._match_product(oi, ex):
+                    matched_extra_idx = e_idx
+                    break
+
+            if matched_extra_idx != -1:
+                ex = extra_items.pop(matched_extra_idx)
+                qty = self._to_float(ex.get("quantity") or ex.get("qty"))
+                free_q = self._to_float(ex.get("free_qty") or ex.get("free"))
+                taxable = self._to_float(ex.get("taxable_amount") or ex.get("taxable_amt"))
+                net_amt = self._to_float(ex.get("net_amount") or ex.get("amount"))
+                b_no = ex.get("batch_no") or "N/A"
+                if b_no and b_no != "N/A":
+                    reconciled_batches.add(b_no.strip().upper())
+
+                reconciled_items.append({
+                    "order_item_id": oi.get("order_item_id") or oi.get("id"),
+                    "product_id": ord_pid,
+                    "product_name": ord_name,
+                    "size": ord_size,
+                    "match_status": "matched" if qty >= ord_q else "partial_match",
+                    "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
+                    "invoiced_qty": int(qty) if qty.is_integer() else qty,
+                    "free_qty": int(free_q) if free_q.is_integer() else free_q,
+                    "taxable_amount": round(taxable, 2),
+                    "gst_amount": round(net_amt - taxable if net_amt >= taxable else 0.0, 2),
+                    "net_amount": round(net_amt, 2),
+                    "batches": [{
+                        "batch_no": b_no,
+                        "quantity": int(qty) if qty.is_integer() else qty,
+                        "free_quantity": int(free_q) if free_q.is_integer() else free_q,
+                        "expiry_date": self._format_expiry_iso(ex.get("expiry_date")),
+                        "match_status": "matched"
+                    }]
+                })
+                if oid:
+                    reconciled_oids.add(oid)
+                continue
+
+            # B. Check if the ordered item exists on an unclaimed parsed invoice line
+            matched_line = None
+            for inv_it in parsed_lines:
+                b_no = (inv_it.get("batch") or inv_it.get("batch_no") or "").strip().upper()
+                if b_no and b_no in reconciled_batches:
                     continue
-                if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
-                    m["match_status"] = "missing"
-                clean_missing.append(m)
-            missing_items = clean_missing
+                if self._match_product(oi, inv_it):
+                    matched_line = inv_it
+                    if b_no:
+                        reconciled_batches.add(b_no)
+                    break
+
+            if matched_line:
+                qty = self._to_float(matched_line.get("qty") or matched_line.get("quantity"))
+                free_q = self._to_float(matched_line.get("free") or matched_line.get("sch") or matched_line.get("free_qty"))
+                taxable = self._to_float(matched_line.get("taxable_amt") or matched_line.get("taxable_amount"))
+                amt = self._to_float(matched_line.get("amount") or matched_line.get("net_amount"))
+                exp_d = self._format_expiry_iso(matched_line.get("expiry") or matched_line.get("exp"))
+
+                reconciled_items.append({
+                    "order_item_id": oi.get("order_item_id") or oi.get("id"),
+                    "product_id": ord_pid,
+                    "product_name": ord_name,
+                    "size": ord_size,
+                    "match_status": "matched" if qty >= ord_q else "partial_match",
+                    "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
+                    "invoiced_qty": int(qty) if qty.is_integer() else qty,
+                    "free_qty": int(free_q) if free_q.is_integer() else free_q,
+                    "taxable_amount": round(taxable, 2),
+                    "gst_amount": round(amt - taxable if amt >= taxable else 0.0, 2),
+                    "net_amount": round(amt, 2),
+                    "batches": [{
+                        "batch_no": matched_line.get("batch") or matched_line.get("batch_no") or "N/A",
+                        "quantity": int(qty) if qty.is_integer() else qty,
+                        "free_quantity": int(free_q) if free_q.is_integer() else free_q,
+                        "expiry_date": exp_d,
+                        "match_status": "matched"
+                    }]
+                })
+                if oid:
+                    reconciled_oids.add(oid)
+                continue
+
+            # C. Truly missing from invoice
+            missing_items.append({
+                "order_item_id": oi.get("order_item_id") or oi.get("id"),
+                "product_id": ord_pid,
+                "product_name": ord_name,
+                "size": ord_size,
+                "match_status": "missing",
+                "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
+                "reason": f"Product {ord_name} was not found on the invoice."
+            })
+
+        # Clean missing_items to ensure no item in reconciled_items is also in missing_items
+        clean_missing = []
+        for m in missing_items:
+            m_oid = str(m.get("order_item_id") or "")
+            if m_oid and m_oid in reconciled_oids:
+                continue
+            if not m.get("match_status") or str(m.get("match_status")).lower() in ["none", "null"]:
+                m["match_status"] = "missing"
+            clean_missing.append(m)
+        missing_items = clean_missing
+
+        # Clean extra_items to ensure no item in reconciled_items is also in extra_items
+        clean_extra = []
+        for ex in extra_items:
+            b_no = (ex.get("batch_no") or "").strip().upper()
+            if b_no and b_no in reconciled_batches:
+                continue
+            clean_extra.append(ex)
+        extra_items = clean_extra
 
         # Enforce exact summary format and match_status consistency
         total_ordered_items = len(order_data.get("items", []))
