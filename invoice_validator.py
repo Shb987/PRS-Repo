@@ -50,8 +50,8 @@ class InvoiceValidator:
                 ai_result = self._validate_with_openai(invoice_text, invoice_tables, normalized_order, parsed_invoice)
                 if ai_result and "data" in ai_result and "match_status" in ai_result:
                     sanitized_ai = self._sanitize_response(ai_result, normalized_order, parsed_invoice)
-                    # If sanitized AI matched or achieved higher confidence, return it
-                    if sanitized_ai.get("match_percentage", 0) >= rule_result.get("match_percentage", 0):
+                    # If sanitized AI matched or achieved strictly higher confidence, return it
+                    if sanitized_ai.get("match_percentage", 0) > rule_result.get("match_percentage", 0):
                         return sanitized_ai
             except Exception as e:
                 print(f"[WARN] OpenAI Validation failed, falling back to rule engine: {e}")
@@ -286,8 +286,26 @@ class InvoiceValidator:
                 # Prefix/substring match (e.g. ASD vs ASD04, or AS-H vs AS-H06), allow token verification
                 pass
             else:
-                # Distinct explicit product codes (e.g. AS-D23 vs BP-05) -> Not the same product
-                return False
+                # Check for generic/truncated vendor prefixes (e.g. 'ASD-', 'ASD', 'AS-A', 'AS-L')
+                is_ord_prefix = (order_raw_code and str(order_raw_code).endswith('-')) or (len(norm_ord_code) <= 3 and not re.search(r'\d', norm_ord_code))
+                is_inv_prefix = (inv_raw_code and str(inv_raw_code).endswith('-')) or (len(norm_inv_code) <= 3 and not re.search(r'\d', norm_inv_code))
+
+                # Compare numeric model identifiers (e.g., '03' in ASH-03 and AS-A03)
+                ord_digits = re.findall(r'\d+', norm_ord_code)
+                inv_digits = re.findall(r'\d+', norm_inv_code)
+
+                if is_ord_prefix or is_inv_prefix:
+                    # One of the codes is a generic category/vendor prefix without specific model number -> allow token verification
+                    pass
+                elif ord_digits and inv_digits and ord_digits == inv_digits:
+                    # Same numeric model identifier (e.g. ASH-03 vs AS-A03) -> allow token verification
+                    pass
+                elif ord_digits and inv_digits and ord_digits != inv_digits:
+                    # Distinct conflicting model numbers (e.g. AS-D23 vs AS-D24, or AS-D04 vs BP-05) -> Not the same product
+                    return False
+                else:
+                    # Generic fallback: allow token verification
+                    pass
 
         # If only order has product code, check if it's embedded in invoice description
         if norm_ord_code and not norm_inv_code:
@@ -303,11 +321,12 @@ class InvoiceValidator:
 
         # --- DESCRIPTIVE TOKEN & FUZZY MATCHING ---
 
-        # Filter out generic pharmaceutical descriptors and size tokens from token set
+        # Filter out generic pharmaceutical descriptors, manufacturer brand tokens, and size tokens from token set
         generic_tokens = {
             "ITEM", "ITEMS", "PRODUCT", "PRODUCTS", "MEDICINE", "TAB", "TABLET", "CAPSULE",
             "SYRUP", "INJ", "INJECTION", "THE", "AND", "OF", "MG", "ML", "GM",
-            "NOS", "BOX", "STRIP", "PACK", "S", "M", "L", "XL", "XXL", "XXXL", "XS", "UNI", "FS"
+            "NOS", "BOX", "STRIP", "PACK", "S", "M", "L", "XL", "XXL", "XXXL", "XS", "UNI", "FS",
+            "ATOM", "WELLNESS", "LTD", "PVT", "PHARMA", "HEALTHCARE"
         }
         core_tokens = [t for t in clean_ord_tokens if t not in generic_tokens]
 
@@ -532,10 +551,10 @@ Return ONLY valid JSON matching this schema:
                     batch_entry = {
                         "batch_no": b_no,
                         "quantity": int(qty) if qty.is_integer() else qty,
-                        "expiry_date": exp_d
+                        "free_quantity": int(free_q) if free_q.is_integer() else free_q,
+                        "expiry_date": exp_d,
+                        "match_status": "matched"
                     }
-                    if free_q > 0:
-                        batch_entry["free_quantity"] = int(free_q) if free_q.is_integer() else free_q
 
                     matched_batches.append(batch_entry)
                     total_invoiced_qty += qty
@@ -548,9 +567,9 @@ Return ONLY valid JSON matching this schema:
 
                     amt = self._to_float(inv_item.get("amount") or inv_item.get("net_amount"))
                     if amt == 0.0 and taxable > 0:
-                        amt = taxable * 1.05
+                        amt = taxable
 
-                    gst = amt - taxable if amt >= taxable else taxable * 0.05
+                    gst = self._to_float(inv_item.get("gst_amt") or inv_item.get("tax_amt") or inv_item.get("gst_amount"))
 
                     item_taxable += taxable
                     item_gst += gst
@@ -558,6 +577,8 @@ Return ONLY valid JSON matching this schema:
 
             if matched_batches:
                 item_status = "matched" if total_invoiced_qty >= ordered_qty else "partial_match"
+                ord_free = self._to_float(ord_item.get("free_qty") or ord_item.get("free") or ord_item.get("sch") or ord_item.get("bonus"))
+                final_free_qty = max(total_free_qty, ord_free)
                 reconciled_items.append({
                     "order_item_id": ord_item_id,
                     "product_id": prod_id,
@@ -566,7 +587,7 @@ Return ONLY valid JSON matching this schema:
                     "match_status": item_status,
                     "ordered_qty": int(ordered_qty) if ordered_qty.is_integer() else ordered_qty,
                     "invoiced_qty": int(total_invoiced_qty) if total_invoiced_qty.is_integer() else total_invoiced_qty,
-                    "free_qty": int(total_free_qty) if total_free_qty.is_integer() else total_free_qty,
+                    "free_qty": int(final_free_qty) if final_free_qty.is_integer() else final_free_qty,
                     "taxable_amount": round(item_taxable, 2),
                     "gst_amount": round(item_gst, 2),
                     "net_amount": round(item_net, 2),
@@ -684,12 +705,13 @@ Return ONLY valid JSON matching this schema:
         final_net = round(self._to_float(meta_from_parsed.get("net_amount") or meta_from_parsed.get("total_amount") or net_amt or net_sum), 2)
 
         invoice_metadata = {
-            "invoice_no": meta_from_parsed.get("invoice_no") or meta_from_parsed.get("invoice_number") or inv_no or "N/A",
-            "invoice_date": meta_from_parsed.get("invoice_date") or meta_from_parsed.get("date") or inv_date or "N/A",
             "gstin": meta_from_parsed.get("gstin") or meta_from_parsed.get("extracted_gstin") or inv_gstin or "N/A",
-            "taxable_amount": final_taxable,
+            "invoice_date": meta_from_parsed.get("invoice_date") or meta_from_parsed.get("date") or inv_date or "N/A",
+            "invoice_no": meta_from_parsed.get("invoice_no") or meta_from_parsed.get("invoice_number") or inv_no or "N/A",
             "net_amount": final_net,
-            "total_amount": final_net
+            "taxable_amount": final_taxable,
+            "total_amount": final_net,
+            "is_duplicate": False
         }
 
         return {
@@ -731,26 +753,30 @@ Return ONLY valid JSON matching this schema:
         meta = inner_data.get("invoice_metadata", data.get("extracted_metadata", {}))
 
         clean_meta = {
-            "invoice_no": meta.get("invoice_no") or meta.get("invoice_number") or "N/A",
-            "invoice_date": meta.get("invoice_date") or meta.get("date") or "N/A",
             "gstin": meta.get("gstin") or meta.get("extracted_gstin") or "N/A",
-            "taxable_amount": round(self._to_float(meta.get("taxable_amount")), 2),
+            "invoice_date": meta.get("invoice_date") or meta.get("date") or "N/A",
+            "invoice_no": meta.get("invoice_no") or meta.get("invoice_number") or "N/A",
             "net_amount": round(self._to_float(meta.get("net_amount") or meta.get("total_amount")), 2),
-            "total_amount": round(self._to_float(meta.get("total_amount") or meta.get("net_amount")), 2)
+            "taxable_amount": round(self._to_float(meta.get("taxable_amount")), 2),
+            "total_amount": round(self._to_float(meta.get("total_amount") or meta.get("net_amount")), 2),
+            "is_duplicate": meta.get("is_duplicate", False)
         }
 
         reconciled_items = inner_data.get("reconciled_items", [])
         missing_items = inner_data.get("missing_items", [])
         extra_items = inner_data.get("extra_items", [])
 
-        # Build batch -> expiry mapping from parsed invoice line items
+        # Build batch -> expiry mapping and batch -> line mapping from parsed invoice line items
         batch_expiry_map = {}
-        if parsed_invoice:
-            for itm in parsed_invoice.get("line_items", []):
-                b_code = (itm.get("batch") or itm.get("batch_no") or "").strip().upper()
-                exp_raw = itm.get("expiry") or itm.get("exp")
-                if b_code and exp_raw and str(exp_raw).upper() not in ["N/A", "NONE", "BLANK", "NULL"]:
-                    batch_expiry_map[b_code] = exp_raw
+        batch_to_line = {}
+        parsed_lines = parsed_invoice.get("line_items", []) if parsed_invoice else []
+        for itm in parsed_lines:
+            b_code = (itm.get("batch") or itm.get("batch_no") or "").strip().upper()
+            exp_raw = itm.get("expiry") or itm.get("exp")
+            if b_code and b_code not in ["N/A", "NONE", "BLANK", "NULL", ""]:
+                batch_to_line[b_code] = itm
+            if b_code and exp_raw and str(exp_raw).upper() not in ["N/A", "NONE", "BLANK", "NULL"]:
+                batch_expiry_map[b_code] = exp_raw
 
         # Build order item lookup for ground truth ordered quantities and IDs
         order_items_list = order_data.get("items", [])
@@ -809,16 +835,51 @@ Return ONLY valid JSON matching this schema:
                 if matching_ord.get("size") and not item.get("size"):
                     item["size"] = matching_ord["size"]
 
+            # Verify batch attribution against parsed invoice lines to prevent LLM hallucinations
+            if matching_ord and parsed_lines:
+                valid_batches = []
+                for b in item.get("batches", []):
+                    b_no = (b.get("batch_no") or "").strip().upper()
+                    if b_no in batch_to_line:
+                        orig_pl = batch_to_line[b_no]
+                        if not self._match_product(matching_ord, orig_pl):
+                            # Misattributed batch by AI (belongs to a different product on the invoice)
+                            continue
+                    valid_batches.append(b)
+
+                if not valid_batches:
+                    # AI completely misattributed batches for this item; recover the real line from parsed_lines
+                    for pl in parsed_lines:
+                        if self._match_product(matching_ord, pl):
+                            pl_b = pl.get("batch") or pl.get("batch_no") or "N/A"
+                            pl_q = self._to_float(pl.get("qty") or pl.get("quantity"))
+                            pl_f = self._to_float(pl.get("free") or pl.get("sch") or pl.get("free_qty"))
+                            pl_tax = self._to_float(pl.get("taxable_amt") or pl.get("taxable_amount"))
+                            pl_amt = self._to_float(pl.get("amount") or pl.get("net_amount"))
+                            valid_batches.append({
+                                "batch_no": pl_b,
+                                "quantity": int(pl_q) if pl_q.is_integer() else pl_q,
+                                "free_quantity": int(pl_f) if pl_f.is_integer() else pl_f,
+                                "expiry_date": self._format_expiry_iso(pl.get("expiry") or pl.get("exp")),
+                                "match_status": "matched"
+                            })
+                            item["invoiced_qty"] = int(pl_q) if pl_q.is_integer() else pl_q
+                            item["taxable_amount"] = round(pl_tax, 2)
+                            item["net_amount"] = round(pl_amt, 2)
+                            break
+                item["batches"] = valid_batches
+
             if item.get("order_item_id") is not None:
                 reconciled_oids.add(str(item["order_item_id"]))
 
             ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
             inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
 
-            # Update free_qty if batches contain free quantities
+            # Update free_qty if batches contain free quantities or order specifies free units
             batch_free_sum = sum(self._to_float(b.get("free_quantity")) for b in item.get("batches", []))
-            if batch_free_sum > self._to_float(item.get("free_qty")):
-                item["free_qty"] = int(batch_free_sum) if batch_free_sum.is_integer() else batch_free_sum
+            ord_free = self._to_float(matching_ord.get("free_qty") or matching_ord.get("free") or matching_ord.get("sch") or matching_ord.get("bonus")) if matching_ord else 0.0
+            final_free_qty = max(batch_free_sum, ord_free)
+            item["free_qty"] = int(final_free_qty) if final_free_qty.is_integer() else final_free_qty
 
             item["match_status"] = "matched" if inv_q >= ord_q else "partial_match"
 
@@ -883,6 +944,8 @@ Return ONLY valid JSON matching this schema:
                 if b_no and b_no != "N/A":
                     reconciled_batches.add(b_no.strip().upper())
 
+                ord_free = self._to_float(oi.get("free_qty") or oi.get("free") or oi.get("sch") or oi.get("bonus"))
+                final_free_qty = max(free_q, ord_free)
                 reconciled_items.append({
                     "order_item_id": oi.get("order_item_id") or oi.get("id"),
                     "product_id": ord_pid,
@@ -891,7 +954,7 @@ Return ONLY valid JSON matching this schema:
                     "match_status": "matched" if qty >= ord_q else "partial_match",
                     "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
                     "invoiced_qty": int(qty) if qty.is_integer() else qty,
-                    "free_qty": int(free_q) if free_q.is_integer() else free_q,
+                    "free_qty": int(final_free_qty) if final_free_qty.is_integer() else final_free_qty,
                     "taxable_amount": round(taxable, 2),
                     "gst_amount": round(net_amt - taxable if net_amt >= taxable else 0.0, 2),
                     "net_amount": round(net_amt, 2),
@@ -925,6 +988,8 @@ Return ONLY valid JSON matching this schema:
                 taxable = self._to_float(matched_line.get("taxable_amt") or matched_line.get("taxable_amount"))
                 amt = self._to_float(matched_line.get("amount") or matched_line.get("net_amount"))
                 exp_d = self._format_expiry_iso(matched_line.get("expiry") or matched_line.get("exp"))
+                ord_free = self._to_float(oi.get("free_qty") or oi.get("free") or oi.get("sch") or oi.get("bonus"))
+                final_free_qty = max(free_q, ord_free)
 
                 reconciled_items.append({
                     "order_item_id": oi.get("order_item_id") or oi.get("id"),
@@ -934,7 +999,7 @@ Return ONLY valid JSON matching this schema:
                     "match_status": "matched" if qty >= ord_q else "partial_match",
                     "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
                     "invoiced_qty": int(qty) if qty.is_integer() else qty,
-                    "free_qty": int(free_q) if free_q.is_integer() else free_q,
+                    "free_qty": int(final_free_qty) if final_free_qty.is_integer() else final_free_qty,
                     "taxable_amount": round(taxable, 2),
                     "gst_amount": round(amt - taxable if amt >= taxable else 0.0, 2),
                     "net_amount": round(amt, 2),
@@ -997,6 +1062,8 @@ Return ONLY valid JSON matching this schema:
         for ex in extra_items:
             b_no = (ex.get("batch_no") or "").strip().upper()
             if b_no and b_no in reconciled_batches:
+                continue
+            if any(self._match_product(r, ex) for r in reconciled_items):
                 continue
             clean_extra.append(ex)
         extra_items = clean_extra
