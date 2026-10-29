@@ -37,12 +37,16 @@ class InvoiceValidator:
         # 1. Fast deterministic verification using local rule engine (< 50ms)
         rule_result = self._validate_rule_based(invoice_text, invoice_tables, normalized_order, parsed_invoice)
 
-        # If rule engine achieves a 100% matched state, return immediately (fast path, < 50ms)
-        if rule_result and rule_result.get("match_status") == "matched" and len(rule_result.get("missing_items", [])) == 0:
+        # If rule engine achieves a 100% matched state, or all ordered items exist on the invoice with 0 missing and 0 extra items, return immediately (fast path, < 50ms)
+        if rule_result and (
+            (rule_result.get("match_status") == "matched" and len(rule_result.get("missing_items", [])) == 0) or
+            (rule_result.get("match_percentage", 0) == 100 and len(rule_result.get("missing_items", [])) == 0 and len(rule_result.get("extra_items", [])) == 0)
+        ):
             rule_result["ai_validated"] = True
             if "data" in rule_result:
                 rule_result["data"]["ai_validated"] = True
             return rule_result
+
 
         # 2. If discrepancies or missing items exist, and OpenAI client is available, attempt AI validation
         if self.client:
@@ -127,13 +131,16 @@ class InvoiceValidator:
         except ValueError:
             return 0.0
 
-    @staticmethod
-    def _normalize_product_code(code_str: Optional[str]) -> Optional[str]:
+    @classmethod
+    def _normalize_product_code(cls, code_str: Optional[str]) -> Optional[str]:
         if not code_str or str(code_str).upper() in ["N/A", "NONE", "NULL", "BLANK", ""]:
             return None
         # Remove whitespace, hyphens, slashes, underscores for robust comparison:
         # e.g., 'AS-D23' -> 'ASD23', 'BP-05' -> 'BP05', 'AS - D23' -> 'ASD23'
         cleaned = re.sub(r'[^A-Z0-9]', '', str(code_str).upper())
+        # Ignore vendor prefixes without model digits (e.g. AS, ASD, ASA, ASB)
+        if not re.search(r'\d', cleaned) and len(cleaned) <= 3:
+            return None
         return cleaned if cleaned else None
 
     @staticmethod
@@ -167,14 +174,114 @@ class InvoiceValidator:
         return InvoiceParser._extract_size_tag(text)
 
     @classmethod
+    def _normalize_surgical_text(cls, text: str) -> str:
+        """
+        Normalizes surgical/medical appliance text by expanding abbreviations,
+        mapping medical synonyms, and stripping vendor prefixes and packaging words like PAIR.
+        """
+        s = text.upper()
+        # Remove known vendor product code prefixes: e.g. AS-A01, AS-A07, AS-D04, AS-B02, AS-E10, CN-05, etc.
+        s = re.sub(r'\b(?:AS|ASD|ASA|ASB|ASE|ASH|BP|DT|CN)-[A-Z0-9]+\b\s*', '', s)
+        # Remove vendor brand prefixes: AS-, AS -, ATOM WELLNESS, ATOM SURGICAL
+        s = re.sub(r'\bAS\s*[-–—]\s*', '', s)
+        s = re.sub(r'\bATOM\s+WELLNESS\b', '', s)
+        s = re.sub(r'\bATOM\s+SURGICAL\b', '', s)
+        # Remove (PAIR), PAIR
+        s = re.sub(r'\((?:PAIR|NOS?)\)', '', s)
+        s = re.sub(r'\bPAIR\b', '', s)
+        # LS / L.S. / LUMBOSACRAL -> LUMBO SACRAL
+        s = re.sub(r'\bL\.?S\.?\b', 'LUMBO SACRAL', s)
+        s = re.sub(r'\bLUMBOSACRAL\b', 'LUMBO SACRAL', s)
+        # BELT / SUPPORT / BINDER (e.g. ABDOMINAL BELT <-> ABDOMINAL SUPPORT, LS BELT <-> LS SUPPORT)
+        s = re.sub(r'\b(SUPPORT|BINDER)\b', 'BELT', s)
+        # METBLOW / METBLOWN / MELTBLOWN
+        s = re.sub(r'\bMETBLOW\b', 'METBLOWN', s)
+        s = re.sub(r'\bMELTBLOWN\b', 'METBLOWN', s)
+        s = re.sub(r'\b3\s*PLY\b', '3PLY', s)
+        # DIGI -> DIGITAL
+        s = re.sub(r'\bDIGI\b', 'DIGITAL', s)
+        # Clean extra whitespace
+        return re.sub(r'\s+', ' ', s).strip()
+
+    @classmethod
+    def _extract_medicine_keys(cls, text: str) -> Dict[str, Any]:
+        """
+        Extracts brand stem, dosage/strength, variant code, formulation letter, and pack count
+        to strictly enforce variant/strength separation.
+        """
+        upper = text.upper()
+        # Remove packaging dimensions (e.g. 10X10, 10*10, 10X3X1, 20X20) so they aren't mistaken for dosage
+        cleaned = re.sub(r'\b\d+\s*[\*xX]\s*\d+(?:\s*[\*xX]\s*\d+)?\b', ' ', upper)
+
+        # 1. Pack count (e.g. 10S, 50S, 100S)
+        pack_match = re.findall(r'\b(\d+)\s*S\b', cleaned)
+        pack = pack_match[0] + "S" if pack_match else None
+
+        # 2. Variant code (e.g. M1, M2, D3, SR, DS, FORTE, PLUS)
+        variant_match = re.findall(r'\b(M[1-9]|D[1-9]|SR|XR|CR|ER|DS|FORTE|PLUS)\b', cleaned)
+        variant = variant_match[0] if variant_match else None
+
+        # 3. Numeric dosage/strength (e.g. 10, 20, 40, 500)
+        unit_match = re.findall(r'\b(\d+(?:\.\d+)?)\s*(?:MG|MCG|G|GM|ML|IU|%)\b', cleaned)
+        dosage = None
+        if unit_match:
+            dosage = unit_match[0]
+        else:
+            # Check for standalone numbers (e.g. ATOMSTA 10, TELMATOM 40, TENATOM 20, ATOMEZ 20)
+            words = cleaned.split()
+            for idx, w in enumerate(words):
+                if re.fullmatch(r'\d+', w):
+                    # If preceded by a brand word (length >= 4) or followed by dosage-like context
+                    if idx > 0 and len(words[idx - 1]) >= 4 and words[idx - 1] not in ["WITH", "MASK", "PLY", "CODE", "HSN"]:
+                        dosage = w
+                        break
+                    elif w in ["10", "20", "25", "30", "40", "50", "75", "100", "150", "200", "250", "400", "500", "650", "800", "1000"]:
+                        dosage = w
+                        break
+
+        # 4. Formulation suffix (e.g. 'P' in ATOFEN P, 'L' in ATOMONT L or ATOMONT-L)
+        formulation_match = re.findall(r'\b(?:ATOFEN\s+([A-Z])|ATOMONT[\s-]+([A-Z]))\b', cleaned)
+        formulation = None
+        if formulation_match:
+            formulation = formulation_match[0][0] or formulation_match[0][1]
+
+        # 5. Core medicine brand stem
+        known_stems = [
+            "ATOMSTA", "TELMATOM", "TENATOM", "ATOMGLIM", "ATOFEN", "ATOMEZ",
+            "ATOMONT", "GASTOMED"
+        ]
+        brand_stem = None
+        for ks in known_stems:
+            if ks in upper:
+                brand_stem = ks
+                break
+
+        if not brand_stem:
+            # Check for other pharmaceutical brand patterns (e.g. starting with ATOM, TELM, TENA)
+            for w in re.findall(r'\b(ATOM[A-Z0-9]+|TELM[A-Z0-9]+|TEN[A-Z0-9]+)\b', upper):
+                if w not in ["ATOM WELLNESS", "ATOM SURGICAL"]:
+                    brand_stem = w
+                    break
+
+        return {
+            "pack": pack,
+            "variant": variant,
+            "dosage": dosage,
+            "formulation": formulation,
+            "brand_stem": brand_stem
+        }
+
+    @classmethod
     def _match_product(cls, order_item: Dict[str, Any], inv_item: Dict[str, Any]) -> bool:
         """
         Determines whether an invoice line item matches an ordered product variant.
         Handles:
-        - Product code recognition (e.g. AS-D23, BP-05) both in dedicated columns and embedded in descriptions.
-        - Size variant tags (e.g. [L], [M], [S], (XL), XXL, UNI, FS) with strict variant preservation.
-        - Side variants (LEFT, RIGHT).
-        - Substring and token matching for product descriptions with specific category preservation.
+        - Product code recognition (e.g. AS-A01, AS-A07, AS-B02, AS-D01, AS-D04, AS-D25, AS-E10, BP-05, DT-811, CN-05)
+        - Strict dosage & strength preservation (ATOMSTA 10 NEVER matches ATOMSTA 20 or ATOMSTA 40; ATOMGLIM M1 NEVER matches M2)
+        - Size variant tags ([L], [M], [S], (XL), XXL, UNI, FS) with strict variant preservation
+        - Side variants (LEFT, RIGHT)
+        - Medical and surgical synonyms (LS = Lumbo Sacral, Belt = Support = Binder, METBLOW = METBLOWN, DIGI = DIGITAL)
+        - Stripping brand prefixes (AS-, ATOM WELLNESS)
         """
         order_name = (order_item.get("product_name") or order_item.get("name") or "").upper().strip()
         inv_desc = (inv_item.get("description") or inv_item.get("item_name") or "").upper().strip()
@@ -188,16 +295,29 @@ class InvoiceValidator:
             order_item.get("sku") or 
             cls._extract_product_code(order_name)
         )
-        inv_raw_code = (
+        if not order_raw_code:
+            for k, v in order_item.items():
+                if isinstance(v, str) and any(tag in v.upper() for tag in ["CODE", "AS-", "BP-", "DT-", "CN-", "ASH-"]):
+                    code_cand = cls._extract_product_code(v)
+                    if code_cand:
+                        order_raw_code = code_cand
+                        break
+
+        # In invoices, the true model/product code is often explicitly in the description (e.g. AS-A07, AS-D04, BP-05)
+        # while the p_code column in OCR may be truncated ("ASA-", "AS-L") or concatenated with HSN/Batch.
+        inv_desc_code = cls._extract_product_code(inv_desc)
+        norm_inv_desc_code = cls._normalize_product_code(inv_desc_code)
+
+        inv_field_code = (
             inv_item.get("p_code") or 
             inv_item.get("product_code") or 
             inv_item.get("code") or 
-            inv_item.get("item_code") or 
-            cls._extract_product_code(inv_desc)
+            inv_item.get("item_code")
         )
+        norm_inv_field_code = cls._normalize_product_code(inv_field_code)
 
         norm_ord_code = cls._normalize_product_code(order_raw_code)
-        norm_inv_code = cls._normalize_product_code(inv_raw_code)
+        norm_inv_code = norm_inv_desc_code or norm_inv_field_code
 
         # 2. Size Variant Extraction & Normalization
         order_raw_size = (
@@ -220,19 +340,17 @@ class InvoiceValidator:
         inv_side = (inv_item.get("side") or ("LEFT" if "LEFT" in inv_desc else ("RIGHT" if "RIGHT" in inv_desc else ""))).upper().strip()
 
         # --- VARIANT COMPATIBILITY CHECKS ---
-        # A. Size Variant Conflict: If both specify a size and they differ -> Mismatch!
+        # A. Size Variant Conflict
         if norm_ord_size and norm_inv_size and norm_ord_size != norm_inv_size:
             if not ({norm_ord_size, norm_inv_size}.issubset({"UNI", "FS"})):
                 return False
 
-        # If order specifies size, but invoice didn't explicitly extract one, check if inv_desc has conflicting size
         if norm_ord_size and not norm_inv_size:
             detected_inv_size = cls._normalize_size_tag(cls._extract_size_tag(inv_desc))
             if detected_inv_size and detected_inv_size != norm_ord_size:
                 if not ({norm_ord_size, detected_inv_size}.issubset({"UNI", "FS"})):
                     return False
 
-        # If invoice specifies size, but order didn't, check if order_name has conflicting size
         if norm_inv_size and not norm_ord_size:
             if norm_inv_size not in ["UNI", "FS"]:
                 detected_ord_size = cls._normalize_size_tag(cls._extract_size_tag(order_name))
@@ -255,57 +373,90 @@ class InvoiceValidator:
         if has_brace_ord != has_brace_inv:
             return False
 
-        # D. "AIR PRO" distinction: if order specifies AIR or PRO, invoice must have it;
-        # if order does not specify AIR PRO, invoice must not be an AIR PRO variant
+        # D. "AIR PRO" distinction
         has_air_pro_ord = ("AIR" in order_name and "PRO" in order_name) or ("ASD23" in (norm_ord_code or ""))
         has_air_pro_inv = ("AIR" in inv_desc and "PRO" in inv_desc) or ("ASD23" in (norm_inv_code or ""))
         if has_air_pro_ord != has_air_pro_inv:
             return False
 
-        # E. Distinct Anatomy / Body Part Conflict (e.g. KNEE vs BOUFFANT, ELBOW vs ARM, etc.)
-        clean_ord_tokens = set(re.findall(r'[A-Z0-9]+', order_name))
-        clean_inv_tokens = set(re.findall(r'[A-Z0-9]+', inv_desc))
+        # --- STRICT DOSAGE, VARIANT & PACK CHECKS (CRITICAL BUG FIX) ---
+        ord_info = cls._extract_medicine_keys(order_name)
+        inv_info = cls._extract_medicine_keys(inv_desc)
 
-        anatomy_tokens = {
-            "KNEE", "ELBOW", "WRIST", "ANKLE", "THUMB", "ARM", "SHOULDER",
-            "CERVICAL", "LUMBAR", "ABDOMINAL", "CHEST", "FINGER", "FOOT", "LEG", "CALF", "THIGH"
-        }
-        ord_anatomy = {t for t in clean_ord_tokens if t in anatomy_tokens}
-        inv_anatomy = {t for t in clean_inv_tokens if t in anatomy_tokens}
-        if ord_anatomy and not (ord_anatomy & inv_anatomy):
-            return False
-        if inv_anatomy and not ord_anatomy:
-            return False
+        # 1. Pack count (e.g. 10S vs 50S vs 100S)
+        if ord_info["pack"] and inv_info["pack"]:
+            if ord_info["pack"] != inv_info["pack"]:
+                return False
+        elif ord_info["pack"] and not inv_info["pack"]:
+            other_packs = re.findall(r'\b\d+\s*S\b', inv_desc)
+            if other_packs and (other_packs[0] + "S") != ord_info["pack"]:
+                return False
+
+        # 2. Variant code (e.g. M1 vs M2)
+        if ord_info["variant"] and inv_info["variant"]:
+            if ord_info["variant"] != inv_info["variant"]:
+                return False
+        elif ord_info["variant"] and not inv_info["variant"]:
+            if not re.search(r'\b' + ord_info["variant"] + r'\b', inv_desc):
+                return False
+        elif inv_info["variant"] and not ord_info["variant"]:
+            if not re.search(r'\b' + inv_info["variant"] + r'\b', order_name):
+                return False
+
+        # 3. Numeric dosage/strength (e.g. 10 vs 20 vs 40)
+        if ord_info["dosage"] and inv_info["dosage"]:
+            if ord_info["dosage"] != inv_info["dosage"]:
+                return False
+        elif ord_info["dosage"] and not inv_info["dosage"]:
+            # If order has a specific dosage, invoice must have that number
+            if not re.search(r'\b' + ord_info["dosage"] + r'\b', inv_desc):
+                return False
+
+        # 4. Formulation suffix (e.g. 'P' in ATOFEN P, 'L' in ATOMONT L)
+        if ord_info["formulation"] and inv_info["formulation"]:
+            if ord_info["formulation"] != inv_info["formulation"]:
+                return False
+
+        # 5. Distinct Medicine Brand Stem Conflict
+        # If order has a recognized medicine brand stem, invoice MUST have the same stem
+        if ord_info["brand_stem"] and inv_info["brand_stem"]:
+            if ord_info["brand_stem"] != inv_info["brand_stem"]:
+                return False
+        elif ord_info["brand_stem"] and not inv_info["brand_stem"]:
+            if ord_info["brand_stem"] not in inv_desc:
+                return False
+        elif inv_info["brand_stem"] and not ord_info["brand_stem"]:
+            if inv_info["brand_stem"] not in order_name:
+                return False
 
         # --- PRODUCT CODE MATCHING ---
         if norm_ord_code and norm_inv_code:
             if norm_ord_code == norm_inv_code:
-                # Matching product codes + matching sizes = definite match!
-                return True
-            elif norm_ord_code in norm_inv_code or norm_inv_code in norm_ord_code:
-                # Prefix/substring match (e.g. ASD vs ASD04, or AS-H vs AS-H06), allow token verification
-                pass
+                # Guard against vendor typo reusing code across distinct categories
+                # (e.g. AS-A01 is Abdominal Belt, but invoice line 7 printed AS-A01 for Travel Neck Pillow)
+                cat_words = ["PILLOW", "COLLAR", "BELT", "MASK", "DIAPER", "PUMP", "NEBULIZER", "THERMOMETER", "MONITOR", "CAP", "WRAP", "ELBOW"]
+                norm_ord_cat = cls._normalize_surgical_text(order_name)
+                norm_inv_cat = cls._normalize_surgical_text(inv_desc)
+                ord_cats = {w for w in cat_words if w in norm_ord_cat}
+                inv_cats = {w for w in cat_words if w in norm_inv_cat}
+                if ord_cats and inv_cats and not (ord_cats & inv_cats):
+                    pass  # Distinct categories, defer to description matching
+                else:
+                    return True
             else:
-                # Check for generic/truncated vendor prefixes (e.g. 'ASD-', 'ASD', 'AS-A', 'AS-L')
-                is_ord_prefix = (order_raw_code and str(order_raw_code).endswith('-')) or (len(norm_ord_code) <= 3 and not re.search(r'\d', norm_ord_code))
-                is_inv_prefix = (inv_raw_code and str(inv_raw_code).endswith('-')) or (len(norm_inv_code) <= 3 and not re.search(r'\d', norm_inv_code))
-
-                # Compare numeric model identifiers (e.g., '03' in ASH-03 and AS-A03)
                 ord_digits = re.findall(r'\d+', norm_ord_code)
                 inv_digits = re.findall(r'\d+', norm_inv_code)
+                ord_letters = re.findall(r'[A-Z]+', norm_ord_code)
+                inv_letters = re.findall(r'[A-Z]+', norm_inv_code)
 
-                if is_ord_prefix or is_inv_prefix:
-                    # One of the codes is a generic category/vendor prefix without specific model number -> allow token verification
-                    pass
-                elif ord_digits and inv_digits and ord_digits == inv_digits:
-                    # Same numeric model identifier (e.g. ASH-03 vs AS-A03) -> allow token verification
-                    pass
-                elif ord_digits and inv_digits and ord_digits != inv_digits:
-                    # Distinct conflicting model numbers (e.g. AS-D23 vs AS-D24, or AS-D04 vs BP-05) -> Not the same product
+                if ord_digits and inv_digits and ord_digits != inv_digits:
+                    # Distinct model numbers (e.g. AS-A01 vs AS-A07, AS-D01 vs AS-D04)
                     return False
-                else:
-                    # Generic fallback: allow token verification
-                    pass
+                elif ord_letters and inv_letters and ord_letters != inv_letters and ord_digits and inv_digits and ord_digits == inv_digits:
+                    # Different letter prefix (e.g. BP05 vs CN05)
+                    # Allow only if descriptions match (e.g. ASH-01 vs AS-A01 for TRAVEL NECK PILLOW)
+                    if ord_letters != inv_letters and not (set(re.findall(r'[A-Z]{4,}', order_name)) & set(re.findall(r'[A-Z]{4,}', inv_desc))):
+                        return False
 
         # If only order has product code, check if it's embedded in invoice description
         if norm_ord_code and not norm_inv_code:
@@ -319,14 +470,31 @@ class InvoiceValidator:
             if norm_inv_code in norm_ord_name_all:
                 return True
 
-        # --- DESCRIPTIVE TOKEN & FUZZY MATCHING ---
+        # --- SURGICAL / DESCRIPTIVE TOKEN & SYNONYM MATCHING ---
+        norm_ord_text = cls._normalize_surgical_text(order_name)
+        norm_inv_text = cls._normalize_surgical_text(inv_desc)
 
-        # Filter out generic pharmaceutical descriptors, manufacturer brand tokens, and size tokens from token set
+        clean_ord_tokens = set(re.findall(r'[A-Z0-9]+', norm_ord_text))
+        clean_inv_tokens = set(re.findall(r'[A-Z0-9]+', norm_inv_text))
+
+        # Check distinct anatomy / body part
+        anatomy_tokens = {
+            "KNEE", "ELBOW", "WRIST", "ANKLE", "THUMB", "ARM", "SHOULDER",
+            "CERVICAL", "LUMBAR", "ABDOMINAL", "CHEST", "FINGER", "FOOT", "LEG", "CALF", "THIGH"
+        }
+        ord_anatomy = {t for t in clean_ord_tokens if t in anatomy_tokens}
+        inv_anatomy = {t for t in clean_inv_tokens if t in anatomy_tokens}
+        if ord_anatomy and not (ord_anatomy & inv_anatomy):
+            return False
+        if inv_anatomy and not ord_anatomy:
+            return False
+
+        # Filter out generic pharmaceutical descriptors, manufacturer brand tokens, and size tokens
         generic_tokens = {
             "ITEM", "ITEMS", "PRODUCT", "PRODUCTS", "MEDICINE", "TAB", "TABLET", "CAPSULE",
             "SYRUP", "INJ", "INJECTION", "THE", "AND", "OF", "MG", "ML", "GM",
             "NOS", "BOX", "STRIP", "PACK", "S", "M", "L", "XL", "XXL", "XXXL", "XS", "UNI", "FS",
-            "ATOM", "WELLNESS", "LTD", "PVT", "PHARMA", "HEALTHCARE"
+            "ATOM", "WELLNESS", "LTD", "PVT", "PHARMA", "HEALTHCARE", "PAIR"
         }
         core_tokens = [t for t in clean_ord_tokens if t not in generic_tokens]
 
@@ -389,19 +557,38 @@ Order Items:
    - Keep distinct variants separate (e.g., size M and size L are distinct items with their own order_item_id).
    - 'UNI', 'UNIVERSAL', or 'FS' denotes Universal / Free Size.
    - Preserve the exact `order_item_id` and `product_id` from the Order Details.
-3. `batches` Array per Item:
-   When an item is fulfilled using multiple batches (e.g. 12 in ASKCM1225 and 8 in KCM02261), group them in that item's `batches` array rather than returning disconnected line items.
-4. `invoiced_qty`:
+3. CRITICAL: Prevent Collapsing Different Dosages/Strengths into One Product:
+   - Treat dosage/strength numbers (10, 20, 40, M1, M2, 500mg, etc.) as STRICT REQUIRED KEYS, NOT as optional fuzzy text.
+   - An invoice item with ATOMSTA 20 must NEVER match an order line of ATOMSTA 10 or ATOMSTA 40.
+   - ATOMGLIM M1 and ATOMGLIM M2 are distinct products and must NEVER be collapsed or matched to each other.
+   - Distinct medicine brand stems (e.g. TELMATOM vs ATOMSTA vs TENATOM vs ATOMEZ) must NEVER match each other.
+   - Distinct pack counts (e.g. 10S vs 50S vs 100S for masks) must NEVER match each other.
+4. Product Code (PCode) Prioritization & Medical Synonyms:
+   - Prioritize matching Product Code / PCode (AS-A01, AS-A07, AS-B02, AS-D01, AS-D04, AS-D25, AS-E10, BP-05, DT-811, CN-05, ASH-01) printed in PCode or Description column before relying solely on product name fuzzy matching.
+   - Medical Synonyms:
+     - LS / L.S. = Lumbo Sacral (CONTOURED LS BELT matches LUMBO SACRAL BELT CONTOURED)
+     - Belt = Support = Binder (ABDOMINAL BELT matches ABDOMINAL SUPPORT)
+     - METBLOW = METBLOWN (AS- MASK 3PLY METBLOWN matches 3 PLY MASK WITH METBLOW)
+     - DIGI = DIGITAL
+   - Ignore manufacturer brand prefixes like AS- (Atom Surgical), ATOM WELLNESS, ATOM.
+5. Handle Separate Bonus / Promotional Free Lines:
+   - When an invoice has lines with Qty: 0 and Free > 0 (or remarks stating "FREE QNTY AGAINST..."), e.g., Line 27: ATOFEN P (Qty: 0, Free: 105), Line 33: ATOMSTA 10 (Qty: 0, Free: 75), recognise these as promotional bonus items for that medicine.
+   - Combine them under that same medicine's `batches` and `free_qty`.
+   - Do NOT treat promotional bonus lines as extra items, errors, or separate missing items.
+   - If paid invoiced quantity is less than ordered quantity, mark that item as `partial_match` in `reconciled_items`. Do NOT place partially fulfilled items in `missing_items`!
+6. `batches` Array per Item:
+   When an item is fulfilled using multiple batches or lines (e.g. paid line + promotional bonus line), group them in that item's `batches` array rather than returning disconnected line items.
+7. `invoiced_qty`:
    Sum of all paid quantities for that item across its batches.
-5. `free_qty`:
-   Sum of all free quantities for that item across its batches.
-6. `missing_items`:
+8. `free_qty`:
+   Sum of all free quantities for that item across its batches (including promotional bonus quantities).
+9. `missing_items`:
    Any ordered product not found on the invoice. Do NOT put items here if they appear on the invoice.
-7. `extra_items`:
-   Any product printed on the invoice that was not in the original order.
-8. `expiry_date` in `batches`:
+10. `extra_items`:
+   Any product printed on the invoice that was not in the original order. Promotional bonus lines belonging to an ordered product must NOT be put here.
+11. `expiry_date` in `batches`:
    ALWAYS extract the batch expiration date from PRE-PARSED INVOICE DATA (field 'expiry') or tables/text. Convert month/year formats like "01/31" into standard ISO "YYYY-MM-DD" (e.g. "2031-01-31", "02/31" -> "2031-02-28", "06/30" -> "2030-06-30"). Never return null when an expiry date is present in the invoice or pre-parsed data.
-9. `summary`:
+12. `summary`:
    - If blocked (0%): "None of the ordered items were found in the uploaded invoice. Document appears to be for a different order."
    - If blocked (< 50%): "Verification Blocked: Only <N> of <T> ordered items matched (<P>%). Document appears to be for a different order."
    - If matched: "All <N> ordered items matched across <V> variants with <F> free units fulfilled."
@@ -548,15 +735,23 @@ Return ONLY valid JSON matching this schema:
                     free_q = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
                     exp_d = self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp"))
 
-                    batch_entry = {
-                        "batch_no": b_no,
-                        "quantity": int(qty) if qty.is_integer() else qty,
-                        "free_quantity": int(free_q) if free_q.is_integer() else free_q,
-                        "expiry_date": exp_d,
-                        "match_status": "matched"
-                    }
+                    # Group batches with identical batch numbers (e.g. paid line + promotional bonus line)
+                    existing_b = next((b for b in matched_batches if b["batch_no"] == b_no), None) if b_no != "N/A" else None
+                    if existing_b:
+                        existing_b["quantity"] += int(qty) if qty.is_integer() else qty
+                        existing_b["free_quantity"] += int(free_q) if free_q.is_integer() else free_q
+                        if not existing_b.get("expiry_date") and exp_d:
+                            existing_b["expiry_date"] = exp_d
+                    else:
+                        batch_entry = {
+                            "batch_no": b_no,
+                            "quantity": int(qty) if qty.is_integer() else qty,
+                            "free_quantity": int(free_q) if free_q.is_integer() else free_q,
+                            "expiry_date": exp_d,
+                            "match_status": "matched"
+                        }
+                        matched_batches.append(batch_entry)
 
-                    matched_batches.append(batch_entry)
                     total_invoiced_qty += qty
                     total_free_qty += free_q
 
@@ -570,6 +765,8 @@ Return ONLY valid JSON matching this schema:
                         amt = taxable
 
                     gst = self._to_float(inv_item.get("gst_amt") or inv_item.get("tax_amt") or inv_item.get("gst_amount"))
+                    if gst == 0.0 and amt > taxable and taxable > 0:
+                        gst = amt - taxable
 
                     item_taxable += taxable
                     item_gst += gst
@@ -848,25 +1045,53 @@ Return ONLY valid JSON matching this schema:
                     valid_batches.append(b)
 
                 if not valid_batches:
-                    # AI completely misattributed batches for this item; recover the real line from parsed_lines
+                    # AI completely misattributed batches for this item; recover the real lines from parsed_lines
+                    matched_tax = 0.0
+                    matched_amt = 0.0
                     for pl in parsed_lines:
                         if self._match_product(matching_ord, pl):
-                            pl_b = pl.get("batch") or pl.get("batch_no") or "N/A"
+                            pl_b = (pl.get("batch") or pl.get("batch_no") or "N/A").strip()
                             pl_q = self._to_float(pl.get("qty") or pl.get("quantity"))
                             pl_f = self._to_float(pl.get("free") or pl.get("sch") or pl.get("free_qty"))
                             pl_tax = self._to_float(pl.get("taxable_amt") or pl.get("taxable_amount"))
                             pl_amt = self._to_float(pl.get("amount") or pl.get("net_amount"))
+                            existing_vb = next((b for b in valid_batches if b["batch_no"] == pl_b), None) if pl_b != "N/A" else None
+                            if existing_vb:
+                                existing_vb["quantity"] += int(pl_q) if pl_q.is_integer() else pl_q
+                                existing_vb["free_quantity"] += int(pl_f) if pl_f.is_integer() else pl_f
+                            else:
+                                valid_batches.append({
+                                    "batch_no": pl_b,
+                                    "quantity": int(pl_q) if pl_q.is_integer() else pl_q,
+                                    "free_quantity": int(pl_f) if pl_f.is_integer() else pl_f,
+                                    "expiry_date": self._format_expiry_iso(pl.get("expiry") or pl.get("exp")),
+                                    "match_status": "matched"
+                                })
+                            matched_tax += pl_tax
+                            matched_amt += pl_amt
+                    if valid_batches:
+                        item["invoiced_qty"] = sum(b["quantity"] for b in valid_batches)
+                        item["taxable_amount"] = round(matched_tax, 2)
+                        item["net_amount"] = round(matched_amt, 2)
+
+                # Merge any promotional bonus lines (qty == 0 and free > 0) from parsed_lines matching this product
+                for pl in parsed_lines:
+                    pl_q = self._to_float(pl.get("qty") or pl.get("quantity"))
+                    pl_f = self._to_float(pl.get("free") or pl.get("sch") or pl.get("free_qty"))
+                    if pl_q == 0 and pl_f > 0 and self._match_product(matching_ord, pl):
+                        pl_b = (pl.get("batch") or pl.get("batch_no") or "N/A").strip()
+                        existing_vb = next((b for b in valid_batches if b["batch_no"] == pl_b), None) if pl_b != "N/A" else None
+                        if existing_vb:
+                            if int(pl_f) > 0 and existing_vb["free_quantity"] < int(pl_f):
+                                existing_vb["free_quantity"] += int(pl_f) if pl_f.is_integer() else pl_f
+                        else:
                             valid_batches.append({
                                 "batch_no": pl_b,
-                                "quantity": int(pl_q) if pl_q.is_integer() else pl_q,
+                                "quantity": 0,
                                 "free_quantity": int(pl_f) if pl_f.is_integer() else pl_f,
                                 "expiry_date": self._format_expiry_iso(pl.get("expiry") or pl.get("exp")),
                                 "match_status": "matched"
                             })
-                            item["invoiced_qty"] = int(pl_q) if pl_q.is_integer() else pl_q
-                            item["taxable_amount"] = round(pl_tax, 2)
-                            item["net_amount"] = round(pl_amt, 2)
-                            break
                 item["batches"] = valid_batches
 
             if item.get("order_item_id") is not None:
@@ -970,46 +1195,57 @@ Return ONLY valid JSON matching this schema:
                     reconciled_oids.add(oid)
                 continue
 
-            # B. Check if the ordered item exists on an unclaimed parsed invoice line
-            matched_line = None
+            # B. Check if the ordered item exists on unclaimed parsed invoice lines
+            matched_lines = []
             for inv_it in parsed_lines:
                 b_no = (inv_it.get("batch") or inv_it.get("batch_no") or "").strip().upper()
                 if b_no and b_no in reconciled_batches:
                     continue
                 if self._match_product(oi, inv_it):
-                    matched_line = inv_it
+                    matched_lines.append(inv_it)
                     if b_no:
                         reconciled_batches.add(b_no)
-                    break
 
-            if matched_line:
-                qty = self._to_float(matched_line.get("qty") or matched_line.get("quantity"))
-                free_q = self._to_float(matched_line.get("free") or matched_line.get("sch") or matched_line.get("free_qty"))
-                taxable = self._to_float(matched_line.get("taxable_amt") or matched_line.get("taxable_amount"))
-                amt = self._to_float(matched_line.get("amount") or matched_line.get("net_amount"))
-                exp_d = self._format_expiry_iso(matched_line.get("expiry") or matched_line.get("exp"))
+            if matched_lines:
+                total_qty = sum(self._to_float(l.get("qty") or l.get("quantity")) for l in matched_lines)
+                total_free = sum(self._to_float(l.get("free") or l.get("sch") or l.get("free_qty")) for l in matched_lines)
+                total_tax = sum(self._to_float(l.get("taxable_amt") or l.get("taxable_amount")) for l in matched_lines)
+                total_amt = sum(self._to_float(l.get("amount") or l.get("net_amount")) for l in matched_lines)
                 ord_free = self._to_float(oi.get("free_qty") or oi.get("free") or oi.get("sch") or oi.get("bonus"))
-                final_free_qty = max(free_q, ord_free)
+                final_free_qty = max(total_free, ord_free)
+
+                item_batches = []
+                for ml in matched_lines:
+                    ml_b = (ml.get("batch") or ml.get("batch_no") or "N/A").strip()
+                    ml_q = self._to_float(ml.get("qty") or ml.get("quantity"))
+                    ml_f = self._to_float(ml.get("free") or ml.get("sch") or ml.get("free_qty"))
+                    ml_exp = self._format_expiry_iso(ml.get("expiry") or ml.get("exp"))
+                    existing_ib = next((b for b in item_batches if b["batch_no"] == ml_b), None) if ml_b != "N/A" else None
+                    if existing_ib:
+                        existing_ib["quantity"] += int(ml_q) if ml_q.is_integer() else ml_q
+                        existing_ib["free_quantity"] += int(ml_f) if ml_f.is_integer() else ml_f
+                    else:
+                        item_batches.append({
+                            "batch_no": ml_b,
+                            "quantity": int(ml_q) if ml_q.is_integer() else ml_q,
+                            "free_quantity": int(ml_f) if ml_f.is_integer() else ml_f,
+                            "expiry_date": ml_exp,
+                            "match_status": "matched"
+                        })
 
                 reconciled_items.append({
                     "order_item_id": oi.get("order_item_id") or oi.get("id"),
                     "product_id": ord_pid,
                     "product_name": ord_name,
                     "size": ord_size,
-                    "match_status": "matched" if qty >= ord_q else "partial_match",
+                    "match_status": "matched" if total_qty >= ord_q else "partial_match",
                     "ordered_qty": int(ord_q) if ord_q.is_integer() else ord_q,
-                    "invoiced_qty": int(qty) if qty.is_integer() else qty,
+                    "invoiced_qty": int(total_qty) if total_qty.is_integer() else total_qty,
                     "free_qty": int(final_free_qty) if final_free_qty.is_integer() else final_free_qty,
-                    "taxable_amount": round(taxable, 2),
-                    "gst_amount": round(amt - taxable if amt >= taxable else 0.0, 2),
-                    "net_amount": round(amt, 2),
-                    "batches": [{
-                        "batch_no": matched_line.get("batch") or matched_line.get("batch_no") or "N/A",
-                        "quantity": int(qty) if qty.is_integer() else qty,
-                        "free_quantity": int(free_q) if free_q.is_integer() else free_q,
-                        "expiry_date": exp_d,
-                        "match_status": "matched"
-                    }]
+                    "taxable_amount": round(total_tax, 2),
+                    "gst_amount": round(total_amt - total_tax if total_amt >= total_tax else 0.0, 2),
+                    "net_amount": round(total_amt, 2),
+                    "batches": item_batches
                 })
                 if oid:
                     reconciled_oids.add(oid)
