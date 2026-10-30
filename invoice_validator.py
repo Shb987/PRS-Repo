@@ -117,6 +117,79 @@ class InvoiceValidator:
         return exp_str
 
     @staticmethod
+    def _format_expiry_mmyyyy(exp_str: Optional[str]) -> Optional[str]:
+        """
+        Converts dates to MM/YYYY format (e.g. '10/2028', '2028-10-31' -> '10/2028', '10/28' -> '10/2028').
+        Preserves string if conversion is not applicable.
+        """
+        if not exp_str or str(exp_str).upper() in ["N/A", "NONE", "BLANK", "", "NULL"]:
+            return None
+        exp_str = str(exp_str).strip()
+        # ISO format: YYYY-MM-DD or YYYY/MM/DD
+        m_iso = re.match(r'(\d{4})[-/](\d{1,2})[-/]\d{1,2}', exp_str)
+        if m_iso:
+            return f"{int(m_iso.group(2)):02d}/{m_iso.group(1)}"
+        # MM/YYYY or MM-YYYY or MM/YY
+        m_full = re.match(r'(\d{1,2})[\./-]((?:20)?\d{2})', exp_str)
+        if m_full:
+            month = int(m_full.group(1))
+            yy_part = m_full.group(2)
+            year = int(yy_part) if len(yy_part) == 4 else (2000 + int(yy_part))
+            if 1 <= month <= 12:
+                return f"{month:02d}/{year}"
+        return exp_str
+
+    @classmethod
+    def _find_free_reward_in_text(cls, text: str, reward_name: Optional[str]) -> float:
+        """
+        Checks if a cross-product free reward is printed in remarks, notes, or free column
+        (e.g., 'Free: 1 ATOMSTA 20', 'ATOMSTA 20 (1 Free)', 'Free Item: ATOMSTA 20 (1)').
+        """
+        if not text or not reward_name:
+            return 0.0
+        tokens = re.findall(r'[A-Z0-9]+', reward_name.upper())
+        if not tokens:
+            return 0.0
+        pat_name = r'\s*'.join(re.escape(t) for t in tokens)
+
+        # Pattern 1: Free/Scheme label with quantity followed by product name
+        p1 = rf'\b(?:FREE|SCHEME|BONUS|FOC)(?:[\s\w]*?)[:\s]+(\d+(?:\.\d+)?)\s*(?:NOS?|UNITS?|PCS?|BOX|STRIP)?\s*(?:OF\s*)?{pat_name}'
+        m1 = re.search(p1, text, re.IGNORECASE)
+        if m1:
+            try:
+                return float(m1.group(1))
+            except ValueError:
+                pass
+
+        # Pattern 2: Free label followed by product name and quantity in parentheses or colon
+        p2 = rf'\b(?:FREE|SCHEME|BONUS|FOC)[\s\w]*?[:\s]+{pat_name}[\s:\-(]*(\d+(?:\.\d+)?)'
+        m2 = re.search(p2, text, re.IGNORECASE)
+        if m2:
+            try:
+                return float(m2.group(1))
+            except ValueError:
+                pass
+
+        # Pattern 3: Product name followed by Free/Scheme with quantity
+        p3 = rf'{pat_name}[\s:\-(]*(\d+(?:\.\d+)?)\s*(?:FREE|SCHEME|BONUS|FOC)'
+        m3 = re.search(p3, text, re.IGNORECASE)
+        if m3:
+            try:
+                return float(m3.group(1))
+            except ValueError:
+                pass
+
+        p4 = rf'{pat_name}[\s:]*(?:FREE|SCHEME|BONUS|FOC)[\s:]*(\d+(?:\.\d+)?)'
+        m4 = re.search(p4, text, re.IGNORECASE)
+        if m4:
+            try:
+                return float(m4.group(1))
+            except ValueError:
+                pass
+
+        return 0.0
+
+    @staticmethod
     def _to_float(val: Any) -> float:
         """
         Safely converts numerical or currency string values to float.
@@ -130,6 +203,14 @@ class InvoiceValidator:
             return float(cleaned) if cleaned else 0.0
         except ValueError:
             return 0.0
+
+    @classmethod
+    def _int_or_float(cls, val: Any) -> Union[int, float]:
+        """
+        Converts value to int if it represents a whole number, otherwise returns float.
+        """
+        f = cls._to_float(val)
+        return int(f) if f.is_integer() else f
 
     @classmethod
     def _normalize_product_code(cls, code_str: Optional[str]) -> Optional[str]:
@@ -571,11 +652,18 @@ Order Items:
      - METBLOW = METBLOWN (AS- MASK 3PLY METBLOWN matches 3 PLY MASK WITH METBLOW)
      - DIGI = DIGITAL
    - Ignore manufacturer brand prefixes like AS- (Atom Surgical), ATOM WELLNESS, ATOM.
-5. Handle Separate Bonus / Promotional Free Lines:
+5. Handle Separate Bonus / Promotional Free Lines & Cross-Product Free Schemes:
    - When an invoice has lines with Qty: 0 and Free > 0 (or remarks stating "FREE QNTY AGAINST..."), e.g., Line 27: ATOFEN P (Qty: 0, Free: 105), Line 33: ATOMSTA 10 (Qty: 0, Free: 75), recognise these as promotional bonus items for that medicine.
    - Combine them under that same medicine's `batches` and `free_qty`.
    - Do NOT treat promotional bonus lines as extra items, errors, or separate missing items.
-   - If paid invoiced quantity is less than ordered quantity, mark that item as `partial_match` in `reconciled_items`. Do NOT place partially fulfilled items in `missing_items`!
+   - Cross-Product Schemes: When an order item has `free_qty > 0` and `free_product_name` (e.g., ordered 'BP MONITOR' with free reward 'ATOMSTA 20' qty 1):
+     Expect a separate line on the invoice for `free_product_name` (ATOMSTA 20) with quantity = `free_qty`, usually billed with Rate = 0 or marked as Free / Scheme / FOC / Bonus, or noted in remarks.
+     Fulfill this as the free reward for that ordered product!
+     Do NOT treat this free reward line as an extra item or error!
+     On the item, populate `free_product_name` and `invoiced_free_qty`.
+     If both the paid product and the free reward product are fulfilled, mark `is_matched: true` and `discrepancies: []`.
+     If the free reward product is missing or quantity is mismatched, mark `is_matched: false`, add to `discrepancies`, and set `match_status: 'partial_match'`.
+   - If paid invoiced quantity is less than ordered quantity, mark that item as `partial_match`. Do NOT place partially fulfilled items in `missing_items`!
 6. `batches` Array per Item:
    When an item is fulfilled using multiple batches or lines (e.g. paid line + promotional bonus line), group them in that item's `batches` array rather than returning disconnected line items.
 7. `invoiced_qty`:
@@ -707,6 +795,7 @@ Return ONLY valid JSON matching this schema:
         if not line_items and invoice_tables:
             line_items = InvoiceParser.parse_line_items(invoice_tables, mode="retailer")
 
+        items_list = []
         reconciled_items = []
         missing_items = []
         matched_inv_indices = set()
@@ -717,13 +806,25 @@ Return ONLY valid JSON matching this schema:
             prod_name = ord_item.get("product_name") or ord_item.get("name", "")
             size = ord_item.get("size") or ord_item.get("variant_label")
             ordered_qty = self._to_float(ord_item.get("ordered_qty") or ord_item.get("order_qty") or ord_item.get("quantity"))
+            free_qty = self._to_float(ord_item.get("free_qty") or ord_item.get("free") or ord_item.get("sch") or ord_item.get("bonus") or 0)
+            free_prod_id = ord_item.get("free_product_id")
+            free_prod_name = ord_item.get("free_product_name")
+            free_prod_code = ord_item.get("free_product_code")
+            free_side = ord_item.get("free_side")
+            free_size = ord_item.get("free_size")
 
+            # Determine whether same-product free or cross-product free
+            c_paid = re.sub(r'[^A-Z0-9]', '', str(prod_name).upper())
+            c_free = re.sub(r'[^A-Z0-9]', '', str(free_prod_name).upper()) if free_prod_name else ""
+            is_cross_product = bool(free_qty > 0 and c_free and c_free != c_paid)
+
+            # Paid item matching
             matched_batches = []
             item_taxable = 0.0
             item_gst = 0.0
             item_net = 0.0
             total_invoiced_qty = 0.0
-            total_free_qty = 0.0
+            total_same_free_qty = 0.0
 
             for idx, inv_item in enumerate(line_items):
                 if idx in matched_inv_indices:
@@ -734,6 +835,7 @@ Return ONLY valid JSON matching this schema:
                     qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
                     free_q = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
                     exp_d = self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp"))
+                    raw_exp = inv_item.get("expiry") or inv_item.get("exp")
 
                     # Group batches with identical batch numbers (e.g. paid line + promotional bonus line)
                     existing_b = next((b for b in matched_batches if b["batch_no"] == b_no), None) if b_no != "N/A" else None
@@ -748,12 +850,13 @@ Return ONLY valid JSON matching this schema:
                             "quantity": int(qty) if qty.is_integer() else qty,
                             "free_quantity": int(free_q) if free_q.is_integer() else free_q,
                             "expiry_date": exp_d,
+                            "raw_expiry": raw_exp,
                             "match_status": "matched"
                         }
                         matched_batches.append(batch_entry)
 
                     total_invoiced_qty += qty
-                    total_free_qty += free_q
+                    total_same_free_qty += free_q
 
                     taxable = self._to_float(inv_item.get("taxable_amt") or inv_item.get("taxable_amount"))
                     rate = self._to_float(inv_item.get("rate") or inv_item.get("price"))
@@ -772,23 +875,113 @@ Return ONLY valid JSON matching this schema:
                     item_gst += gst
                     item_net += amt
 
+            # Free Reward Item Matching (for cross-product schemes)
+            total_invoiced_free_qty = 0.0
+            reward_batches = []
+            if is_cross_product:
+                reward_target = {
+                    "product_id": free_prod_id,
+                    "product_name": free_prod_name,
+                    "product_code": free_prod_code,
+                    "size": free_size,
+                    "side": free_side,
+                    "order_qty": free_qty
+                }
+                for idx, inv_item in enumerate(line_items):
+                    if idx in matched_inv_indices:
+                        continue
+                    if self._match_product(reward_target, inv_item):
+                        matched_inv_indices.add(idx)
+                        l_free = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
+                        l_qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
+                        reward_q = l_free if l_free > 0 else l_qty
+                        total_invoiced_free_qty += reward_q
+                        r_bno = inv_item.get("batch") or inv_item.get("batch_no") or "N/A"
+                        r_exp = self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp"))
+                        reward_batches.append({
+                            "batch_no": r_bno,
+                            "quantity": 0,
+                            "free_quantity": int(reward_q) if reward_q.is_integer() else reward_q,
+                            "expiry_date": r_exp,
+                            "raw_expiry": inv_item.get("expiry") or inv_item.get("exp"),
+                            "match_status": "matched"
+                        })
+
+                # Check if printed in remarks/free column or invoice text
+                if total_invoiced_free_qty < free_qty:
+                    found_in_text = self._find_free_reward_in_text(invoice_text, free_prod_name)
+                    if found_in_text > 0:
+                        total_invoiced_free_qty += found_in_text
+            else:
+                total_invoiced_free_qty = total_same_free_qty
+
+            # Determine primary batch_no and expiry_date for this item
+            primary_batch_no = "N/A"
+            primary_exp_iso = None
+            primary_exp_mmyyyy = None
             if matched_batches:
-                item_status = "matched" if total_invoiced_qty >= ordered_qty else "partial_match"
-                ord_free = self._to_float(ord_item.get("free_qty") or ord_item.get("free") or ord_item.get("sch") or ord_item.get("bonus"))
-                final_free_qty = max(total_free_qty, ord_free)
+                primary_batch_no = matched_batches[0]["batch_no"]
+                primary_exp_iso = matched_batches[0]["expiry_date"]
+                primary_exp_mmyyyy = self._format_expiry_mmyyyy(primary_exp_iso) or self._format_expiry_mmyyyy(matched_batches[0].get("raw_expiry"))
+
+            # Calculate item match status and discrepancies
+            discrepancies = []
+            paid_matched = bool(total_invoiced_qty == ordered_qty)
+            if total_invoiced_qty < ordered_qty:
+                discrepancies.append(f"Invoiced quantity ({int(total_invoiced_qty) if total_invoiced_qty.is_integer() else total_invoiced_qty}) is less than ordered quantity ({int(ordered_qty) if ordered_qty.is_integer() else ordered_qty}) for {prod_name}.")
+            elif total_invoiced_qty > ordered_qty:
+                discrepancies.append(f"Invoiced quantity ({int(total_invoiced_qty) if total_invoiced_qty.is_integer() else total_invoiced_qty}) exceeds ordered quantity ({int(ordered_qty) if ordered_qty.is_integer() else ordered_qty}) for {prod_name}.")
+
+            free_matched = True
+            if free_qty > 0:
+                if total_invoiced_free_qty < free_qty:
+                    free_matched = False
+                    target_free_name = free_prod_name if is_cross_product else prod_name
+                    if total_invoiced_free_qty == 0:
+                        discrepancies.append(f"Free reward item {target_free_name} missing from invoice (expected: {int(free_qty) if free_qty.is_integer() else free_qty}, invoiced: 0).")
+                    else:
+                        discrepancies.append(f"Free reward item {target_free_name} quantity mismatch (expected: {int(free_qty) if free_qty.is_integer() else free_qty}, invoiced: {int(total_invoiced_free_qty) if total_invoiced_free_qty.is_integer() else total_invoiced_free_qty}).")
+
+            item_is_matched = bool(paid_matched and free_matched and total_invoiced_qty > 0)
+
+            # Build item entry according to expected format
+            item_entry = {
+                "order_item_id": ord_item_id,
+                "product_id": prod_id,
+                "product_name": prod_name,
+                "ordered_qty": int(ordered_qty) if ordered_qty.is_integer() else ordered_qty,
+                "invoiced_qty": int(total_invoiced_qty) if total_invoiced_qty.is_integer() else total_invoiced_qty,
+                "free_qty": int(free_qty) if free_qty.is_integer() else free_qty,
+                "free_product_name": free_prod_name if is_cross_product else (free_prod_name or None),
+                "invoiced_free_qty": int(total_invoiced_free_qty) if total_invoiced_free_qty.is_integer() else total_invoiced_free_qty,
+                "batch_no": primary_batch_no,
+                "expiry_date": primary_exp_mmyyyy or (primary_exp_iso or "N/A"),
+                "is_matched": item_is_matched,
+                "discrepancies": discrepancies
+            }
+            items_list.append(item_entry)
+
+            if matched_batches or total_invoiced_qty > 0:
+                final_free_qty = max(total_invoiced_free_qty, free_qty) if free_matched else total_invoiced_free_qty
                 reconciled_items.append({
                     "order_item_id": ord_item_id,
                     "product_id": prod_id,
                     "product_name": prod_name,
                     "size": size,
-                    "match_status": item_status,
+                    "match_status": "matched" if item_is_matched else "partial_match",
                     "ordered_qty": int(ordered_qty) if ordered_qty.is_integer() else ordered_qty,
                     "invoiced_qty": int(total_invoiced_qty) if total_invoiced_qty.is_integer() else total_invoiced_qty,
                     "free_qty": int(final_free_qty) if final_free_qty.is_integer() else final_free_qty,
+                    "free_product_name": free_prod_name if is_cross_product else (free_prod_name or None),
+                    "invoiced_free_qty": int(total_invoiced_free_qty) if total_invoiced_free_qty.is_integer() else total_invoiced_free_qty,
+                    "batch_no": primary_batch_no,
+                    "expiry_date": primary_exp_iso or primary_exp_mmyyyy,
+                    "is_matched": item_is_matched,
+                    "discrepancies": discrepancies,
                     "taxable_amount": round(item_taxable, 2),
                     "gst_amount": round(item_gst, 2),
                     "net_amount": round(item_net, 2),
-                    "batches": matched_batches
+                    "batches": matched_batches + reward_batches
                 })
             else:
                 missing_items.append({
@@ -802,27 +995,29 @@ Return ONLY valid JSON matching this schema:
                 })
 
         # Identify extra items present on invoice but absent in order
-        extra_items = []
+        unmatched_invoice_items = []
         for idx, inv_item in enumerate(line_items):
             if idx not in matched_inv_indices:
                 qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
                 free_q = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
                 taxable = self._to_float(inv_item.get("taxable_amt") or inv_item.get("taxable_amount"))
                 amt = self._to_float(inv_item.get("amount") or inv_item.get("net_amount"))
-                extra_items.append({
+                unmatched_invoice_items.append({
                     "product_name": inv_item.get("description") or inv_item.get("item_name") or "Unknown Product",
                     "batch_no": inv_item.get("batch") or inv_item.get("batch_no") or "N/A",
                     "match_status": "extra",
                     "quantity": int(qty) if qty.is_integer() else qty,
                     "free_qty": int(free_q) if free_q.is_integer() else free_q,
-                    "expiry_date": self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp")),
+                    "expiry_date": self._format_expiry_mmyyyy(inv_item.get("expiry") or inv_item.get("exp")),
                     "taxable_amount": round(taxable, 2),
                     "net_amount": round(amt, 2)
                 })
+        extra_items = unmatched_invoice_items
 
         # Determine match_percentage, match_status and human-readable summary
         total_ordered_items = len(order_items)
-        matched_items_count = len(reconciled_items)
+        matched_items_count = sum(1 for it in items_list if it["invoiced_qty"] > 0)
+        all_items_matched = (len(items_list) == total_ordered_items and all(it["is_matched"] for it in items_list) and len(missing_items) == 0)
 
         if total_ordered_items > 0:
             calc_pct = round((matched_items_count / total_ordered_items) * 100, 2)
@@ -830,22 +1025,7 @@ Return ONLY valid JSON matching this schema:
         else:
             match_percentage = 0
 
-        # Check if quantities match for all reconciled items and collect details
-        all_quantities_fulfilled = True
-        qty_mismatched_labels = []
-        for item in reconciled_items:
-            ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
-            inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
-            if inv_q < ord_q:
-                all_quantities_fulfilled = False
-            if inv_q != ord_q:
-                pname = item.get("product_name") or item.get("name") or "Unknown Product"
-                psize = item.get("size")
-                if psize and str(psize).upper() not in ["NONE", "NULL", "N/A", ""]:
-                    label = f"{pname} [{psize}] (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
-                else:
-                    label = f"{pname} (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
-                qty_mismatched_labels.append(label)
+        total_free_rewards = sum(it.get("free_qty", 0) for it in items_list if it.get("free_qty", 0) > 0)
 
         missing_labels = []
         for m in missing_items:
@@ -856,26 +1036,27 @@ Return ONLY valid JSON matching this schema:
             else:
                 missing_labels.append(pname)
 
-        # Match status classification
-        # "matched": match_percentage == 100% with matching quantities.
-        # "partial_match": match_percentage >= 50% (at least half the ordered products exist on the invoice).
-        # "blocked" / "unmatched": match_percentage < 50% or 0%.
-        if match_percentage == 100 and all_quantities_fulfilled and len(missing_items) == 0:
+        if all_items_matched:
             match_status = "matched"
-            total_ord_qty = sum(r["ordered_qty"] for r in reconciled_items)
-            total_free = sum(r["free_qty"] for r in reconciled_items)
+            if total_free_rewards > 0:
+                summary = f"All {total_ordered_items} items and {self._int_or_float(total_free_rewards)} free reward items matched with the invoice."
+            else:
+                summary = f"All {total_ordered_items} items matched with the invoice."
             if len(extra_items) > 0:
                 extra_labels = [e.get("product_name") or "Extra Product" for e in extra_items[:3]]
-                summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order ({', '.join(extra_labels)})."
-            else:
-                summary = f"All {int(total_ord_qty)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
-        elif match_percentage >= 50 or (len(reconciled_items) > 0 and len(missing_items) > 0):
+                summary += f" Verification Note: Contains {len(extra_items)} extra items not in order ({', '.join(extra_labels)})."
+        elif matched_items_count > 0:
             match_status = "partial_match"
+            all_discrepancies = []
+            for it in items_list:
+                all_discrepancies.extend(it.get("discrepancies", []))
             if len(missing_items) > 0 and len(extra_items) > 0:
                 missing_str = ", ".join(missing_labels[:3])
                 extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
                 item_word = "item" if len(missing_items) == 1 else "items"
                 summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
+            elif all_discrepancies:
+                summary = f"Verification Mismatch: {'; '.join(d.rstrip('.') for d in all_discrepancies[:2])}. Please verify before approving."
             elif len(extra_items) > 0:
                 extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
                 summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
@@ -884,8 +1065,7 @@ Return ONLY valid JSON matching this schema:
                 item_word = "item" if len(missing_items) == 1 else "items"
                 summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Please verify before approving."
             else:
-                mismatch_str = ", ".join(qty_mismatched_labels[:3])
-                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity for {mismatch_str}. Please verify before approving."
+                summary = "Verification Mismatch: One or more items did not match order details. Please verify before approving."
         else:
             match_status = "blocked"
             if match_percentage == 0:
@@ -901,35 +1081,49 @@ Return ONLY valid JSON matching this schema:
         final_taxable = round(self._to_float(meta_from_parsed.get("taxable_amount") or taxable_amt or taxable_sum), 2)
         final_net = round(self._to_float(meta_from_parsed.get("net_amount") or meta_from_parsed.get("total_amount") or net_amt or net_sum), 2)
 
+        raw_inv_date = meta_from_parsed.get("invoice_date") or meta_from_parsed.get("date") or inv_date or "N/A"
+        clean_inv_date = str(raw_inv_date)
+        m_d = re.match(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})', clean_inv_date)
+        if m_d:
+            clean_inv_date = f"{m_d.group(3)}-{int(m_d.group(2)):02d}-{int(m_d.group(1)):02d}"
+
         invoice_metadata = {
-            "gstin": meta_from_parsed.get("gstin") or meta_from_parsed.get("extracted_gstin") or inv_gstin or "N/A",
-            "invoice_date": meta_from_parsed.get("invoice_date") or meta_from_parsed.get("date") or inv_date or "N/A",
             "invoice_no": meta_from_parsed.get("invoice_no") or meta_from_parsed.get("invoice_number") or inv_no or "N/A",
-            "net_amount": final_net,
+            "invoice_number": meta_from_parsed.get("invoice_no") or meta_from_parsed.get("invoice_number") or inv_no or "N/A",
+            "date": clean_inv_date,
+            "invoice_date": clean_inv_date,
+            "gstin": meta_from_parsed.get("gstin") or meta_from_parsed.get("extracted_gstin") or inv_gstin or order_data.get("purchaser_gstin") or "N/A",
+            "total_taxable": f"{final_taxable:.2f}",
             "taxable_amount": final_taxable,
+            "net_amount": f"{final_net:.2f}",
             "total_amount": final_net,
+            "purchaser_name": meta_from_parsed.get("purchaser_name") or order_data.get("purchaser_name") or "N/A",
+            "purchaser_gstin": meta_from_parsed.get("purchaser_gstin") or order_data.get("purchaser_gstin") or "N/A",
             "is_duplicate": False
         }
 
         return {
-            "success": match_status != "blocked",
+            "status": "success" if match_status == "matched" else ("warning" if match_status == "partial_match" else "error"),
             "match_status": match_status,
             "match_percentage": match_percentage,
             "summary": summary,
+            "items": items_list,
+            "reconciled_items": reconciled_items,
             "missing_items": missing_items,
             "extra_items": extra_items,
-            "reconciled_items": reconciled_items,
+            "unmatched_invoice_items": extra_items,
             "data": {
                 "match_status": match_status,
                 "match_percentage": match_percentage,
                 "summary": summary,
                 "invoice_metadata": invoice_metadata,
+                "items": items_list,
                 "reconciled_items": reconciled_items,
                 "missing_items": missing_items,
-                "extra_items": extra_items
+                "extra_items": extra_items,
+                "unmatched_invoice_items": extra_items
             },
-            # Backward-compatibility aliases
-            "status": "success" if match_status == "matched" else ("warning" if match_status == "partial_match" else "error"),
+            "success": match_status != "blocked",
             "message": summary,
             "extracted_metadata": invoice_metadata
         }
@@ -1304,9 +1498,148 @@ Return ONLY valid JSON matching this schema:
             clean_extra.append(ex)
         extra_items = clean_extra
 
+        # Check cross-product free schemes and reconcile reward items that may have been placed in extra_items
+        for oi in order_items_list:
+            free_qty = self._to_float(oi.get("free_qty") or oi.get("free") or oi.get("sch") or oi.get("bonus") or 0)
+            free_prod_name = oi.get("free_product_name")
+            paid_prod_name = oi.get("product_name") or oi.get("name", "")
+            c_paid = re.sub(r'[^A-Z0-9]', '', str(paid_prod_name).upper())
+            c_free = re.sub(r'[^A-Z0-9]', '', str(free_prod_name).upper()) if free_prod_name else ""
+            is_cross = bool(free_qty > 0 and c_free and c_free != c_paid)
+
+            if is_cross:
+                matching_r = None
+                for r in reconciled_items:
+                    if self._match_product(oi, r):
+                        matching_r = r
+                        break
+
+                reward_target = {
+                    "product_id": oi.get("free_product_id"),
+                    "product_name": free_prod_name,
+                    "product_code": oi.get("free_product_code"),
+                    "size": oi.get("free_size"),
+                    "side": oi.get("free_side"),
+                    "order_qty": free_qty
+                }
+
+                # Check if the reward item was placed in extra_items
+                matched_extra_reward_idx = -1
+                for e_idx, ex in enumerate(extra_items):
+                    if self._match_product(reward_target, ex):
+                        matched_extra_reward_idx = e_idx
+                        break
+
+                if matched_extra_reward_idx != -1:
+                    ex = extra_items.pop(matched_extra_reward_idx)
+                    ex_qty = self._to_float(ex.get("quantity") or ex.get("qty") or ex.get("free_qty"))
+                    if matching_r is not None:
+                        current_free = self._to_float(matching_r.get("invoiced_free_qty") or 0)
+                        matching_r["invoiced_free_qty"] = int(current_free + ex_qty) if (current_free + ex_qty).is_integer() else (current_free + ex_qty)
+                        matching_r["free_product_name"] = free_prod_name
+                        matching_r.setdefault("batches", []).append({
+                            "batch_no": ex.get("batch_no") or "N/A",
+                            "quantity": 0,
+                            "free_quantity": int(ex_qty) if ex_qty.is_integer() else ex_qty,
+                            "expiry_date": self._format_expiry_iso(ex.get("expiry_date")),
+                            "match_status": "matched"
+                        })
+                elif matching_r is not None and self._to_float(matching_r.get("invoiced_free_qty") or 0) < free_qty:
+                    # Check text for remarks/free column mentions
+                    found_free = self._find_free_reward_in_text(invoice_text if 'invoice_text' in locals() else "", free_prod_name)
+                    if found_free > 0:
+                        current_free = self._to_float(matching_r.get("invoiced_free_qty") or 0)
+                        matching_r["invoiced_free_qty"] = int(current_free + found_free) if (current_free + found_free).is_integer() else (current_free + found_free)
+
+        # Build items list matching exact expected schema
+        items_list = []
+        for oi in order_items_list:
+            ord_item_id = oi.get("order_item_id") or oi.get("id")
+            prod_id = oi.get("product_id") or oi.get("id")
+            prod_name = oi.get("product_name") or oi.get("name", "")
+            ordered_qty = self._to_float(oi.get("ordered_qty") or oi.get("order_qty") or oi.get("quantity"))
+            free_qty = self._to_float(oi.get("free_qty") or oi.get("free") or oi.get("sch") or oi.get("bonus") or 0)
+            free_prod_name = oi.get("free_product_name")
+            c_paid = re.sub(r'[^A-Z0-9]', '', str(prod_name).upper())
+            c_free = re.sub(r'[^A-Z0-9]', '', str(free_prod_name).upper()) if free_prod_name else ""
+            is_cross = bool(free_qty > 0 and c_free and c_free != c_paid)
+
+            matching_r = None
+            for r in reconciled_items:
+                r_oid = str(r.get("order_item_id") or "")
+                if ord_item_id is not None and r_oid == str(ord_item_id):
+                    matching_r = r
+                    break
+                if self._match_product(oi, r):
+                    matching_r = r
+                    break
+
+            if matching_r:
+                inv_qty = self._to_float(matching_r.get("invoiced_qty") or matching_r.get("quantity"))
+                inv_free = self._to_float(matching_r.get("invoiced_free_qty") or matching_r.get("free_qty"))
+                batches = matching_r.get("batches", [])
+                primary_b = batches[0]["batch_no"] if batches else (matching_r.get("batch_no") or "N/A")
+                primary_exp = batches[0]["expiry_date"] if batches else matching_r.get("expiry_date")
+                exp_fmt = self._format_expiry_mmyyyy(primary_exp) or (primary_exp or "N/A")
+
+                discrepancies = []
+                paid_matched = bool(inv_qty == ordered_qty)
+                if inv_qty < ordered_qty:
+                    discrepancies.append(f"Invoiced quantity ({int(inv_qty) if inv_qty.is_integer() else inv_qty}) is less than ordered quantity ({int(ordered_qty) if ordered_qty.is_integer() else ordered_qty}) for {prod_name}.")
+                elif inv_qty > ordered_qty:
+                    discrepancies.append(f"Invoiced quantity ({int(inv_qty) if inv_qty.is_integer() else inv_qty}) exceeds ordered quantity ({int(ordered_qty) if ordered_qty.is_integer() else ordered_qty}) for {prod_name}.")
+
+                free_matched = True
+                if free_qty > 0:
+                    if inv_free < free_qty:
+                        free_matched = False
+                        target_name = free_prod_name if is_cross else prod_name
+                        if inv_free == 0:
+                            discrepancies.append(f"Free reward item {target_name} missing from invoice (expected: {int(free_qty) if free_qty.is_integer() else free_qty}, invoiced: 0).")
+                        else:
+                            discrepancies.append(f"Free reward item {target_name} quantity mismatch (expected: {int(free_qty) if free_qty.is_integer() else free_qty}, invoiced: {int(inv_free) if inv_free.is_integer() else inv_free}).")
+
+                item_matched = bool(paid_matched and free_matched and inv_qty > 0)
+                matching_r["is_matched"] = item_matched
+                matching_r["discrepancies"] = discrepancies
+                matching_r["match_status"] = "matched" if item_matched else "partial_match"
+                matching_r["free_product_name"] = free_prod_name if is_cross else (free_prod_name or None)
+                matching_r["invoiced_free_qty"] = int(inv_free) if inv_free.is_integer() else inv_free
+
+                items_list.append({
+                    "order_item_id": ord_item_id,
+                    "product_id": prod_id,
+                    "product_name": prod_name,
+                    "ordered_qty": int(ordered_qty) if ordered_qty.is_integer() else ordered_qty,
+                    "invoiced_qty": int(inv_qty) if inv_qty.is_integer() else inv_qty,
+                    "free_qty": int(free_qty) if free_qty.is_integer() else free_qty,
+                    "free_product_name": free_prod_name if is_cross else (free_prod_name or None),
+                    "invoiced_free_qty": int(inv_free) if inv_free.is_integer() else inv_free,
+                    "batch_no": primary_b,
+                    "expiry_date": exp_fmt,
+                    "is_matched": item_matched,
+                    "discrepancies": discrepancies
+                })
+            else:
+                items_list.append({
+                    "order_item_id": ord_item_id,
+                    "product_id": prod_id,
+                    "product_name": prod_name,
+                    "ordered_qty": int(ordered_qty) if ordered_qty.is_integer() else ordered_qty,
+                    "invoiced_qty": 0,
+                    "free_qty": int(free_qty) if free_qty.is_integer() else free_qty,
+                    "free_product_name": free_prod_name if is_cross else (free_prod_name or None),
+                    "invoiced_free_qty": 0,
+                    "batch_no": "N/A",
+                    "expiry_date": "N/A",
+                    "is_matched": False,
+                    "discrepancies": [f"Product {prod_name} was not found on the invoice."]
+                })
+
         # Enforce exact summary format and match_status consistency
         total_ordered_items = len(order_data.get("items", []))
-        matched_items_count = len(reconciled_items)
+        matched_items_count = sum(1 for it in items_list if it["invoiced_qty"] > 0)
+        all_items_matched = bool(len(items_list) == total_ordered_items and all(it["is_matched"] for it in items_list) and len(missing_items) == 0)
 
         if total_ordered_items > 0:
             calc_pct = round((matched_items_count / total_ordered_items) * 100, 2)
@@ -1314,22 +1647,7 @@ Return ONLY valid JSON matching this schema:
         else:
             match_percentage = 0
 
-        # Check if quantities match for all reconciled items and collect details
-        all_quantities_fulfilled = True
-        qty_mismatched_labels = []
-        for item in reconciled_items:
-            ord_q = self._to_float(item.get("ordered_qty") or item.get("order_qty"))
-            inv_q = self._to_float(item.get("invoiced_qty") or item.get("quantity"))
-            if inv_q < ord_q:
-                all_quantities_fulfilled = False
-            if inv_q != ord_q:
-                pname = item.get("product_name") or item.get("name") or "Unknown Product"
-                psize = item.get("size")
-                if psize and str(psize).upper() not in ["NONE", "NULL", "N/A", ""]:
-                    label = f"{pname} [{psize}] (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
-                else:
-                    label = f"{pname} (invoiced: {int(inv_q) if inv_q.is_integer() else inv_q}, ordered: {int(ord_q) if ord_q.is_integer() else ord_q})"
-                qty_mismatched_labels.append(label)
+        total_free_rewards = sum(it.get("free_qty", 0) for it in items_list if it.get("free_qty", 0) > 0)
 
         missing_labels = []
         for m in missing_items:
@@ -1340,22 +1658,27 @@ Return ONLY valid JSON matching this schema:
             else:
                 missing_labels.append(pname)
 
-        if match_percentage == 100 and all_quantities_fulfilled and len(missing_items) == 0:
+        if all_items_matched:
             match_status = "matched"
-            total_ord = sum(self._to_float(i.get("ordered_qty") or i.get("order_qty")) for i in reconciled_items)
-            total_free = sum(self._to_float(i.get("free_qty")) for i in reconciled_items)
+            if total_free_rewards > 0:
+                summary = f"All {total_ordered_items} items and {self._int_or_float(total_free_rewards)} free reward items matched with the invoice."
+            else:
+                summary = f"All {total_ordered_items} items matched with the invoice."
             if len(extra_items) > 0:
                 extra_labels = [e.get("product_name") or "Extra Product" for e in extra_items[:3]]
-                summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled. Verification Note: Contains {len(extra_items)} extra items not in order ({', '.join(extra_labels)})."
-            else:
-                summary = f"All {int(total_ord)} ordered items matched across {len(reconciled_items)} variants with {int(total_free)} free units fulfilled."
-        elif match_percentage >= 50 or (len(reconciled_items) > 0 and len(missing_items) > 0):
+                summary += f" Verification Note: Contains {len(extra_items)} extra items not in order ({', '.join(extra_labels)})."
+        elif matched_items_count > 0:
             match_status = "partial_match"
+            all_discrepancies = []
+            for it in items_list:
+                all_discrepancies.extend(it.get("discrepancies", []))
             if len(missing_items) > 0 and len(extra_items) > 0:
                 missing_str = ", ".join(missing_labels[:3])
                 extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
                 item_word = "item" if len(missing_items) == 1 else "items"
                 summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
+            elif all_discrepancies:
+                summary = f"Verification Mismatch: {'; '.join(d.rstrip('.') for d in all_discrepancies[:2])}. Please verify before approving."
             elif len(extra_items) > 0:
                 extra_str = ", ".join([e.get("product_name") or "Extra Item" for e in extra_items[:3]])
                 summary = f"Verification Mismatch: Contains {len(extra_items)} extra items not in order ({extra_str}). Please verify before approving."
@@ -1364,8 +1687,7 @@ Return ONLY valid JSON matching this schema:
                 item_word = "item" if len(missing_items) == 1 else "items"
                 summary = f"Verification Mismatch: Missing {len(missing_items)} ordered {item_word} ({missing_str}). Please verify before approving."
             else:
-                mismatch_str = ", ".join(qty_mismatched_labels[:3])
-                summary = f"Verification Mismatch: Invoiced quantity differs from ordered quantity for {mismatch_str}. Please verify before approving."
+                summary = "Verification Mismatch: One or more items did not match order details. Please verify before approving."
         else:
             match_status = "blocked"
             if match_percentage == 0:
@@ -1374,25 +1696,52 @@ Return ONLY valid JSON matching this schema:
                 missing_str = f" ({', '.join(missing_labels[:3])})" if missing_labels else ""
                 summary = f"Verification Blocked: Only {matched_items_count} of {total_ordered_items} ordered items matched{missing_str}. Document appears to be for a different order or insufficient fulfillment."
 
+        raw_inv_date = meta.get("invoice_date") or meta.get("date") or "N/A"
+        clean_inv_date = str(raw_inv_date)
+        m_d = re.match(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})', clean_inv_date)
+        if m_d:
+            clean_inv_date = f"{m_d.group(3)}-{int(m_d.group(2)):02d}-{int(m_d.group(1)):02d}"
+
+        final_taxable = round(self._to_float(meta.get("taxable_amount")), 2)
+        final_net = round(self._to_float(meta.get("total_amount") or meta.get("net_amount")), 2)
+
+        clean_meta = {
+            "invoice_no": meta.get("invoice_no") or meta.get("invoice_number") or "N/A",
+            "invoice_number": meta.get("invoice_no") or meta.get("invoice_number") or "N/A",
+            "date": clean_inv_date,
+            "invoice_date": clean_inv_date,
+            "gstin": meta.get("gstin") or meta.get("extracted_gstin") or order_data.get("purchaser_gstin") or "N/A",
+            "total_taxable": f"{final_taxable:.2f}",
+            "taxable_amount": final_taxable,
+            "net_amount": f"{final_net:.2f}",
+            "total_amount": final_net,
+            "purchaser_name": meta.get("purchaser_name") or order_data.get("purchaser_name") or "N/A",
+            "purchaser_gstin": meta.get("purchaser_gstin") or order_data.get("purchaser_gstin") or "N/A",
+            "is_duplicate": meta.get("is_duplicate", False)
+        }
+
         return {
-            "success": match_status != "blocked",
+            "status": "success" if match_status == "matched" else ("warning" if match_status == "partial_match" else "error"),
             "match_status": match_status,
             "match_percentage": match_percentage,
             "summary": summary,
+            "items": items_list,
+            "reconciled_items": reconciled_items,
             "missing_items": missing_items,
             "extra_items": extra_items,
-            "reconciled_items": reconciled_items,
+            "unmatched_invoice_items": extra_items,
             "data": {
                 "match_status": match_status,
                 "match_percentage": match_percentage,
                 "summary": summary,
                 "invoice_metadata": clean_meta,
+                "items": items_list,
                 "reconciled_items": reconciled_items,
                 "missing_items": missing_items,
-                "extra_items": extra_items
+                "extra_items": extra_items,
+                "unmatched_invoice_items": extra_items
             },
-            # Backward-compatibility aliases
-            "status": "success" if match_status == "matched" else ("warning" if match_status == "partial_match" else "error"),
+            "success": match_status != "blocked",
             "message": summary,
             "extracted_metadata": clean_meta
         }

@@ -64,7 +64,7 @@ def validate_invoice(order_type='retailer', mode=None, **kwargs):
         request.form.get('order_type') or 
         'retailer'
     )
-    active_mode = resolved_order_type if resolved_order_type in ['admin', 'retailer'] else 'retailer'
+    active_mode = resolved_order_type if resolved_order_type in ['admin', 'distributor', 'retailer'] else 'distributor'
     # 1. Parse order_data from request
     order_data = None
     

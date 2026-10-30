@@ -365,16 +365,16 @@ class InvoiceParser:
         expiry date strictly belongs to that specific product row in the original PDF.
         """
         # Fields to extract for each mode
-        if mode == "admin":
+        if mode in ["admin", "distributor"]:
             target_fields = [
-                "description", "p_code", "size", "hsn", "batch", "expiry", "qty", 
+                "description", "p_code", "size", "hsn", "batch", "expiry", "qty", "free", "sch",
                 "pack", "mrp", "ptr", "pts", "disc_per", "rate", 
-                "taxable_amt", "free", "sgst", "cgst", "igst"
+                "taxable_amt", "amount", "sgst", "cgst", "igst"
             ]
         else: # retailer
             target_fields = [
                 "sno", "p_code", "size", "rack", "mfr", "description", "pack", "hsn", "batch", 
-                "expiry", "qty", "sch", "mrp", "rate", "sch_disc", "disc_per", "disc", "gst", "taxable_amt", "amount"
+                "expiry", "qty", "free", "sch", "mrp", "rate", "sch_disc", "disc_per", "disc", "gst", "taxable_amt", "amount"
             ]
 
         extracted_items = []
