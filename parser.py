@@ -359,12 +359,83 @@ class InvoiceParser:
         return None
 
     @staticmethod
+    def _to_float(val: Any) -> float:
+        if val is None or val == "" or str(val).upper() in ["N/A", "NONE", "NULL"]:
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        cleaned = re.sub(r'[^\d.]', '', str(val))
+        try:
+            return float(cleaned) if cleaned else 0.0
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def is_invalid_or_phantom_line(item: Union[Dict[str, Any], str, List[str]]) -> bool:
+        """
+        Filters out non-product, footer, or phantom table lines:
+        1. Discard any item where product_name is empty, numeric-only (e.g. '0.00', '0', '1.00'), or less than 2 alphabetical letters.
+        2. Discard any item where quantity == 0 AND free_qty == 0 AND net_amount == 0.
+        """
+        if isinstance(item, list):
+            row_str = " ".join([str(c).strip() for c in item if c])
+            if not row_str:
+                return True
+            alpha_count = len(re.findall(r'[a-zA-Z]', row_str))
+            if alpha_count < 2 or bool(re.fullmatch(r'[\d\s.,/\\-]+', row_str)):
+                return True
+            return False
+
+        if isinstance(item, dict):
+            name = str(item.get("description") or item.get("product_name") or item.get("item_name") or "").strip()
+            if not name or name.upper() in ["N/A", "NONE", "NULL", "BLANK", "-", "--"]:
+                return True
+
+            alpha_count = len(re.findall(r'[a-zA-Z]', name))
+            if alpha_count < 2 or bool(re.fullmatch(r'[\d\s.,/\\-]+', name)):
+                return True
+
+            def _get_float(k_list):
+                for k in k_list:
+                    v = item.get(k)
+                    if v is not None and str(v).strip() not in ["", "N/A", "NONE", "NULL"]:
+                        s = re.sub(r'[^\d.]', '', str(v))
+                        try:
+                            return float(s) if s else 0.0
+                        except ValueError:
+                            return 0.0
+                return 0.0
+
+            qty = _get_float(["qty", "quantity"])
+            free_q = _get_float(["free", "free_qty", "sch"])
+            net_amt = _get_float(["net_amount", "amount", "total_amt", "taxable_amount", "taxable_amt", "rate", "price"])
+
+            if qty == 0.0 and free_q == 0.0 and net_amt == 0.0:
+                return True
+
+            return False
+
+        if isinstance(item, str):
+            s = item.strip()
+            if not s or s.upper() in ["N/A", "NONE", "NULL", "BLANK", "-", "--"]:
+                return True
+            alpha_count = len(re.findall(r'[a-zA-Z]', s))
+            if alpha_count < 2 or bool(re.fullmatch(r'[\d\s.,/\\-]+', s)):
+                return True
+            return False
+
+        return True
+
+    @staticmethod
     def is_tax_or_summary_row(item: Union[Dict[str, Any], str, List[str]]) -> bool:
         """
         Detects if a line item, description string, or table row represents a GST/tax summary breakdown
         (e.g., 'GST 5.00% 30281.25', 'GST 12.00% 0.00', 'SGST', 'CGST', 'IGST', 'TOTAL')
         or a non-product line with 0 rate, 0 qty, and 0 free.
         """
+        if InvoiceParser.is_invalid_or_phantom_line(item):
+            return True
+
         if isinstance(item, list):
             row_str = " ".join([str(c).strip() for c in item if c]).upper()
             if not row_str:
@@ -713,7 +784,14 @@ class InvoiceParser:
                     if item.get("description", "N/A") != "N/A" and not InvoiceParser.is_tax_or_summary_row(item):
                         extracted_items.append(item)
                         
-        return extracted_items
+        # Final cleanup filter: discard empty, numeric-only, < 2 letters, or 0 qty & 0 free & 0 amount rows
+        clean_extracted = []
+        for it in extracted_items:
+            if InvoiceParser.is_tax_or_summary_row(it) or InvoiceParser.is_invalid_or_phantom_line(it):
+                continue
+            clean_extracted.append(it)
+
+        return clean_extracted
 
     @staticmethod
     def _extract_invoice_number(text: str) -> str:

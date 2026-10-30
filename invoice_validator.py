@@ -293,6 +293,15 @@ class InvoiceValidator:
         return InvoiceParser.is_tax_or_summary_row(item)
 
     @classmethod
+    def _is_invalid_or_phantom_line(cls, item: Union[Dict[str, Any], str, List[str]]) -> bool:
+        """
+        Checks if an item is empty, numeric-only (e.g. '0.00', '0', '1.00'), has < 2 letters,
+        or has quantity == 0 AND free_qty == 0 AND net_amount == 0.
+        """
+        from parser import InvoiceParser
+        return InvoiceParser.is_invalid_or_phantom_line(item)
+
+    @classmethod
     def _get_product_family_key(cls, item: Dict[str, Any]) -> str:
         """
         Derives a normalized family key across multi-size product variants (e.g. KNEE CAP,
@@ -755,7 +764,9 @@ Order Items:
 10. `extra_items`:
    Any product printed on the invoice that was not in the original order.
    CRITICAL: At the bottom of each page, ignore GST/Tax summary tables (e.g. "GST 5.00%", "GST 12.00%", "SGST", "CGST", "IGST", "TOTAL", taxable amounts, or rows with 0 rate/qty).
-   NEVER include GST summary tables or tax breakdown rows in extra_items or line items!
+   CRITICAL: Discard any line item where product_name is empty, numeric-only (e.g. "0.00", "0", "1.00"), or has less than 2 alphabetical letters.
+   CRITICAL: Discard any line item where quantity == 0 AND free_qty == 0 AND net_amount == 0.
+   NEVER include GST summary tables, tax breakdown rows, or phantom "0.00" footer values in extra_items or line items!
    Promotional bonus lines and cross-product scheme lines belonging to an ordered product must NOT be put here.
 11. `expiry_date` in `batches`:
    ALWAYS extract the batch expiration date from PRE-PARSED INVOICE DATA (field 'expiry') or tables/text. Convert month/year formats like "01/31" into standard ISO "YYYY-MM-DD" (e.g. "2031-01-31", "02/31" -> "2031-02-28", "06/30" -> "2030-06-30"). Never return null when an expiry date is present in the invoice or pre-parsed data.
@@ -877,8 +888,8 @@ Return ONLY valid JSON matching this schema:
         line_items = parsed_invoice.get("line_items", []) if parsed_invoice else []
         if not line_items and invoice_tables:
             line_items = InvoiceParser.parse_line_items(invoice_tables, mode="retailer")
-        # Filter out GST breakdown tables and tax summary rows
-        line_items = [it for it in line_items if not self._is_tax_or_summary_row(it)]
+        # Filter out GST breakdown tables, tax summary rows, and phantom 0.00 rows
+        line_items = [it for it in line_items if not self._is_tax_or_summary_row(it) and not self._is_invalid_or_phantom_line(it)]
 
         # Pre-match cross-product free schemes (Qty: 0, Free: X rows)
         # Ensures lines like ATOMSTA 10 (Qty: 0, Free: 75) and ATOFEN P (Qty: 0, Free: 105)
@@ -1142,7 +1153,7 @@ Return ONLY valid JSON matching this schema:
         unmatched_invoice_items = []
         for idx, inv_item in enumerate(line_items):
             if idx not in matched_inv_indices and idx not in cross_claimed_indices:
-                if self._is_tax_or_summary_row(inv_item):
+                if self._is_tax_or_summary_row(inv_item) or self._is_invalid_or_phantom_line(inv_item):
                     continue
                 qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
                 free_q = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
@@ -1158,7 +1169,8 @@ Return ONLY valid JSON matching this schema:
                     "taxable_amount": round(taxable, 2),
                     "net_amount": round(amt, 2)
                 })
-        extra_items = unmatched_invoice_items
+        extra_items = [ex for ex in unmatched_invoice_items if not self._is_tax_or_summary_row(ex) and not self._is_invalid_or_phantom_line(ex)]
+        unmatched_invoice_items = extra_items
 
         # Apply Variant Group Free Pooling (Issue 2)
         self._apply_variant_group_free_pooling(items_list, reconciled_items)
@@ -1310,7 +1322,7 @@ Return ONLY valid JSON matching this schema:
         batch_expiry_map = {}
         batch_to_line = {}
         parsed_lines = parsed_invoice.get("line_items", []) if parsed_invoice else []
-        parsed_lines = [l for l in parsed_lines if not self._is_tax_or_summary_row(l)]
+        parsed_lines = [l for l in parsed_lines if not self._is_tax_or_summary_row(l) and not self._is_invalid_or_phantom_line(l)]
         for itm in parsed_lines:
             b_code = (itm.get("batch") or itm.get("batch_no") or "").strip().upper()
             exp_raw = itm.get("expiry") or itm.get("exp")
@@ -1662,7 +1674,7 @@ Return ONLY valid JSON matching this schema:
         # Clean extra_items to ensure no item in reconciled_items is also in extra_items
         clean_extra = []
         for ex in extra_items:
-            if self._is_tax_or_summary_row(ex):
+            if self._is_tax_or_summary_row(ex) or self._is_invalid_or_phantom_line(ex):
                 continue
             b_no = (ex.get("batch_no") or "").strip().upper()
             if b_no and b_no in reconciled_batches:
@@ -1831,6 +1843,9 @@ Return ONLY valid JSON matching this schema:
 
         # Apply Variant Group Free Pooling (Issue 2)
         self._apply_variant_group_free_pooling(items_list, reconciled_items)
+
+        extra_items = [ex for ex in extra_items if not self._is_tax_or_summary_row(ex) and not self._is_invalid_or_phantom_line(ex)]
+        unmatched_invoice_items = extra_items
 
         # Enforce exact summary format and match_status consistency
         total_ordered_items = len(order_data.get("items", []))
