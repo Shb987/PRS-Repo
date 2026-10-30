@@ -285,6 +285,81 @@ class InvoiceValidator:
         return re.sub(r'\s+', ' ', s).strip()
 
     @classmethod
+    def _is_tax_or_summary_row(cls, item: Union[Dict[str, Any], str, List[str]]) -> bool:
+        """
+        Checks if an item, description, or table row is a GST/tax summary breakdown or total row.
+        """
+        from parser import InvoiceParser
+        return InvoiceParser.is_tax_or_summary_row(item)
+
+    @classmethod
+    def _get_product_family_key(cls, item: Dict[str, Any]) -> str:
+        """
+        Derives a normalized family key across multi-size product variants (e.g. KNEE CAP,
+        ANKLE BINDER, LS BELT, ABDOMINAL SUPPORT, SOFT CERVICAL COLLAR in sizes M, L, XL),
+        while strictly preserving medicine strength/dosage separation (e.g. ATOMSTA 10 vs ATOMSTA 20).
+        """
+        name = (item.get("product_name") or item.get("name") or "").upper().strip()
+        norm = cls._normalize_surgical_text(name)
+        norm = re.sub(r'[\[\(\{]\s*(?:XXXL|XXL|2XL|3XL|XL|XS|S|M|L|FREE\s*SIZE|FS|UNI(?:VERSAL)?)\s*[\]\)\}]', '', norm, flags=re.IGNORECASE)
+        norm = re.sub(r'\b(?:SIZE|SZ)[:\s-]+(?:XXXL|XXL|2XL|3XL|XL|XS|S|M|L|FREE\s*SIZE|FS|UNI(?:VERSAL)?)\b', '', norm, flags=re.IGNORECASE)
+        norm = re.sub(r'(?:^|[\s\-_/])(?:XXXL|XXL|2XL|3XL|XL|XS|S|M|L|UNI(?:VERSAL)?)(?:\s*$|[\s\-_/,])', ' ', norm, flags=re.IGNORECASE)
+        stem = re.sub(r'[^A-Z0-9]', '', norm)
+        return stem if stem else "UNKNOWN_FAMILY"
+
+    @classmethod
+    def _apply_variant_group_free_pooling(
+        cls,
+        items_list: List[Dict[str, Any]],
+        reconciled_items: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Variant Group Free Pooling (Multi-Size Products):
+        For products with variants (e.g. KNEE CAP, ANKLE BINDER, LS BELT, ABDOMINAL SUPPORT,
+        SOFT CERVICAL COLLAR in sizes M, L, XL), free quantity might be placed on size M, with 0 on L and XL in the order.
+        On the invoice, the supplier distributes them evenly (e.g. 1 on M, 1 on L, 1 on XL, Total = 3).
+        If total ordered free for the product family equals or is satisfied by total invoiced free across all sizes,
+        mark variants with matching paid quantities as MATCHED, clearing free discrepancy notes.
+        """
+        families = {}
+        for idx, it in enumerate(items_list):
+            fkey = cls._get_product_family_key(it)
+            families.setdefault(fkey, []).append(idx)
+
+        for fkey, idxs in families.items():
+            if len(idxs) <= 1:
+                continue
+
+            total_family_ordered_free = sum(cls._to_float(items_list[i].get("free_qty", 0)) for i in idxs)
+            total_family_invoiced_free = sum(cls._to_float(items_list[i].get("invoiced_free_qty", 0)) for i in idxs)
+
+            if total_family_ordered_free > 0 and total_family_invoiced_free >= total_family_ordered_free:
+                for i in idxs:
+                    it = items_list[i]
+                    ord_q = cls._to_float(it.get("ordered_qty", 0))
+                    inv_q = cls._to_float(it.get("invoiced_qty", 0))
+                    paid_satisfied = bool(inv_q == ord_q and inv_q > 0)
+                    if paid_satisfied:
+                        it["discrepancies"] = [
+                            d for d in it.get("discrepancies", [])
+                            if not any(k in d.lower() for k in ["free reward", "free item", "free qty", "free quantity", "bonus"])
+                        ]
+                        if len(it["discrepancies"]) == 0:
+                            it["is_matched"] = True
+
+                        oid = it.get("order_item_id")
+                        for r in reconciled_items:
+                            r_oid = r.get("order_item_id")
+                            if oid is not None and str(oid) == str(r_oid):
+                                r["discrepancies"] = [
+                                    d for d in r.get("discrepancies", [])
+                                    if not any(k in d.lower() for k in ["free reward", "free item", "free qty", "free quantity", "bonus"])
+                                ]
+                                if len(r["discrepancies"]) == 0:
+                                    r["is_matched"] = True
+                                    r["match_status"] = "matched"
+
+    @classmethod
     def _extract_medicine_keys(cls, text: str) -> Dict[str, Any]:
         """
         Extracts brand stem, dosage/strength, variant code, formulation letter, and pack count
@@ -652,18 +727,23 @@ Order Items:
      - METBLOW = METBLOWN (AS- MASK 3PLY METBLOWN matches 3 PLY MASK WITH METBLOW)
      - DIGI = DIGITAL
    - Ignore manufacturer brand prefixes like AS- (Atom Surgical), ATOM WELLNESS, ATOM.
-5. Handle Separate Bonus / Promotional Free Lines & Cross-Product Free Schemes:
-   - When an invoice has lines with Qty: 0 and Free > 0 (or remarks stating "FREE QNTY AGAINST..."), e.g., Line 27: ATOFEN P (Qty: 0, Free: 105), Line 33: ATOMSTA 10 (Qty: 0, Free: 75), recognise these as promotional bonus items for that medicine.
-   - Combine them under that same medicine's `batches` and `free_qty`.
-   - Do NOT treat promotional bonus lines as extra items, errors, or separate missing items.
-   - Cross-Product Schemes: When an order item has `free_qty > 0` and `free_product_name` (e.g., ordered 'BP MONITOR' with free reward 'ATOMSTA 20' qty 1):
-     Expect a separate line on the invoice for `free_product_name` (ATOMSTA 20) with quantity = `free_qty`, usually billed with Rate = 0 or marked as Free / Scheme / FOC / Bonus, or noted in remarks.
+5. Handle Cross-Product Free Schemes & Promotional Bonus Lines:
+   - Cross-Product Schemes (CRITICAL): When an order item has `free_qty > 0` and `free_product_name` (e.g. ordered 'BP MONITOR' with free reward 'ATOMSTA 10' qty 75, or 'NEBULIZER' with free reward 'ATOFEN P' qty 105):
+     The invoice may list these as separate rows with Qty: 0 and Free: X (e.g. Line 33: ATOMSTA 10 Qty: 0, Free: 75; Line 27: ATOFEN P Qty: 0, Free: 105).
+     The invoice remarks may state: "FREE QNTY AGAINST BP,NEBULIZER PURCHASE".
+     CRITICAL: Match each Qty: 0, Free > 0 row to the parent order item whose `free_product_name` and `free_qty` match (e.g. assign ATOMSTA 10 Qty: 0, Free: 75 to BP MONITOR, NOT to the billed ATOMSTA 10 product).
+     Do NOT merge cross-product scheme items into the same-name billed product!
      Fulfill this as the free reward for that ordered product!
      Do NOT treat this free reward line as an extra item or error!
      On the item, populate `free_product_name` and `invoiced_free_qty`.
      If both the paid product and the free reward product are fulfilled, mark `is_matched: true` and `discrepancies: []`.
      If the free reward product is missing or quantity is mismatched, mark `is_matched: false`, add to `discrepancies`, and set `match_status: 'partial_match'`.
+   - Same-Product Free Lines: If an invoice row has Qty: 0 and Free > 0 matching a billed product that is NOT claimed by any cross-product scheme, combine it under that same medicine's batches and free_qty.
    - If paid invoiced quantity is less than ordered quantity, mark that item as `partial_match`. Do NOT place partially fulfilled items in `missing_items`!
+5b. Variant Group Free Pooling (Multi-Size Products):
+   - For products with variants (e.g. KNEE CAP, ANKLE BINDER, LS BELT, ABDOMINAL SUPPORT, SOFT CERVICAL COLLAR in sizes M, L, XL):
+   - If the order places free quantity on one size (e.g. 3 on M, 0 on L, 0 on XL), but the invoice distributes them across variants (e.g. 1 on M, 1 on L, 1 on XL), pool free quantities across the entire product family.
+   - If total ordered free for the product family equals total invoiced free across all sizes (3 == 1+1+1), mark all variants with matching paid quantities as MATCHED with discrepancies: [].
 6. `batches` Array per Item:
    When an item is fulfilled using multiple batches or lines (e.g. paid line + promotional bonus line), group them in that item's `batches` array rather than returning disconnected line items.
 7. `invoiced_qty`:
@@ -673,7 +753,10 @@ Order Items:
 9. `missing_items`:
    Any ordered product not found on the invoice. Do NOT put items here if they appear on the invoice.
 10. `extra_items`:
-   Any product printed on the invoice that was not in the original order. Promotional bonus lines belonging to an ordered product must NOT be put here.
+   Any product printed on the invoice that was not in the original order.
+   CRITICAL: At the bottom of each page, ignore GST/Tax summary tables (e.g. "GST 5.00%", "GST 12.00%", "SGST", "CGST", "IGST", "TOTAL", taxable amounts, or rows with 0 rate/qty).
+   NEVER include GST summary tables or tax breakdown rows in extra_items or line items!
+   Promotional bonus lines and cross-product scheme lines belonging to an ordered product must NOT be put here.
 11. `expiry_date` in `batches`:
    ALWAYS extract the batch expiration date from PRE-PARSED INVOICE DATA (field 'expiry') or tables/text. Convert month/year formats like "01/31" into standard ISO "YYYY-MM-DD" (e.g. "2031-01-31", "02/31" -> "2031-02-28", "06/30" -> "2030-06-30"). Never return null when an expiry date is present in the invoice or pre-parsed data.
 12. `summary`:
@@ -794,6 +877,45 @@ Return ONLY valid JSON matching this schema:
         line_items = parsed_invoice.get("line_items", []) if parsed_invoice else []
         if not line_items and invoice_tables:
             line_items = InvoiceParser.parse_line_items(invoice_tables, mode="retailer")
+        # Filter out GST breakdown tables and tax summary rows
+        line_items = [it for it in line_items if not self._is_tax_or_summary_row(it)]
+
+        # Pre-match cross-product free schemes (Qty: 0, Free: X rows)
+        # Ensures lines like ATOMSTA 10 (Qty: 0, Free: 75) and ATOFEN P (Qty: 0, Free: 105)
+        # are mapped to their parent order item (BP MONITOR, NEBULIZER) and NOT lumped into
+        # the same-name billed items (ATOMSTA 10, ATOFEN P).
+        cross_product_claims = {}
+        cross_claimed_indices = set()
+
+        for ord_item in order_items:
+            oi_id = ord_item.get("order_item_id") or ord_item.get("id")
+            p_name = ord_item.get("product_name") or ord_item.get("name", "")
+            f_qty = self._to_float(ord_item.get("free_qty") or ord_item.get("free") or ord_item.get("sch") or ord_item.get("bonus") or 0)
+            f_name = ord_item.get("free_product_name")
+
+            c_paid = re.sub(r'[^A-Z0-9]', '', str(p_name).upper())
+            c_free = re.sub(r'[^A-Z0-9]', '', str(f_name).upper()) if f_name else ""
+            is_cross = bool(f_qty > 0 and c_free and c_free != c_paid)
+
+            if is_cross:
+                reward_target = {
+                    "product_id": ord_item.get("free_product_id"),
+                    "product_name": f_name,
+                    "product_code": ord_item.get("free_product_code"),
+                    "size": ord_item.get("free_size"),
+                    "side": ord_item.get("free_side"),
+                    "order_qty": f_qty
+                }
+                for idx, inv_it in enumerate(line_items):
+                    if idx in cross_claimed_indices:
+                        continue
+                    l_qty = self._to_float(inv_it.get("qty") or inv_it.get("quantity"))
+                    l_free = self._to_float(inv_it.get("free") or inv_it.get("sch") or inv_it.get("free_qty"))
+                    if (l_qty == 0 and l_free > 0) or (l_free == f_qty):
+                        if self._match_product(reward_target, inv_it):
+                            cross_product_claims.setdefault(oi_id, []).append(idx)
+                            cross_claimed_indices.add(idx)
+                            break
 
         items_list = []
         reconciled_items = []
@@ -827,7 +949,7 @@ Return ONLY valid JSON matching this schema:
             total_same_free_qty = 0.0
 
             for idx, inv_item in enumerate(line_items):
-                if idx in matched_inv_indices:
+                if idx in matched_inv_indices or idx in cross_claimed_indices:
                     continue
                 if self._match_product(ord_item, inv_item):
                     matched_inv_indices.add(idx)
@@ -879,35 +1001,57 @@ Return ONLY valid JSON matching this schema:
             total_invoiced_free_qty = 0.0
             reward_batches = []
             if is_cross_product:
-                reward_target = {
-                    "product_id": free_prod_id,
-                    "product_name": free_prod_name,
-                    "product_code": free_prod_code,
-                    "size": free_size,
-                    "side": free_side,
-                    "order_qty": free_qty
-                }
-                for idx, inv_item in enumerate(line_items):
-                    if idx in matched_inv_indices:
-                        continue
-                    if self._match_product(reward_target, inv_item):
-                        matched_inv_indices.add(idx)
-                        l_free = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
-                        l_qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
-                        reward_q = l_free if l_free > 0 else l_qty
-                        total_invoiced_free_qty += reward_q
-                        r_bno = inv_item.get("batch") or inv_item.get("batch_no") or "N/A"
-                        r_exp = self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp"))
-                        reward_batches.append({
-                            "batch_no": r_bno,
-                            "quantity": 0,
-                            "free_quantity": int(reward_q) if reward_q.is_integer() else reward_q,
-                            "expiry_date": r_exp,
-                            "raw_expiry": inv_item.get("expiry") or inv_item.get("exp"),
-                            "match_status": "matched"
-                        })
+                # 1. Use pre-matched cross-product scheme lines first
+                claimed_idxs = cross_product_claims.get(ord_item_id, [])
+                for c_idx in claimed_idxs:
+                    inv_item = line_items[c_idx]
+                    matched_inv_indices.add(c_idx)
+                    l_free = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
+                    l_qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
+                    reward_q = l_free if l_free > 0 else l_qty
+                    total_invoiced_free_qty += reward_q
+                    r_bno = inv_item.get("batch") or inv_item.get("batch_no") or "N/A"
+                    r_exp = self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp"))
+                    reward_batches.append({
+                        "batch_no": r_bno,
+                        "quantity": 0,
+                        "free_quantity": int(reward_q) if reward_q.is_integer() else reward_q,
+                        "expiry_date": r_exp,
+                        "raw_expiry": inv_item.get("expiry") or inv_item.get("exp"),
+                        "match_status": "matched"
+                    })
 
-                # Check if printed in remarks/free column or invoice text
+                # 2. If not satisfied, scan remaining line items
+                if total_invoiced_free_qty < free_qty:
+                    reward_target = {
+                        "product_id": free_prod_id,
+                        "product_name": free_prod_name,
+                        "product_code": free_prod_code,
+                        "size": free_size,
+                        "side": free_side,
+                        "order_qty": free_qty
+                    }
+                    for idx, inv_item in enumerate(line_items):
+                        if idx in matched_inv_indices or idx in cross_claimed_indices:
+                            continue
+                        if self._match_product(reward_target, inv_item):
+                            matched_inv_indices.add(idx)
+                            l_free = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
+                            l_qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
+                            reward_q = l_free if l_free > 0 else l_qty
+                            total_invoiced_free_qty += reward_q
+                            r_bno = inv_item.get("batch") or inv_item.get("batch_no") or "N/A"
+                            r_exp = self._format_expiry_iso(inv_item.get("expiry") or inv_item.get("exp"))
+                            reward_batches.append({
+                                "batch_no": r_bno,
+                                "quantity": 0,
+                                "free_quantity": int(reward_q) if reward_q.is_integer() else reward_q,
+                                "expiry_date": r_exp,
+                                "raw_expiry": inv_item.get("expiry") or inv_item.get("exp"),
+                                "match_status": "matched"
+                            })
+
+                # 3. Check if printed in remarks/free column or invoice text
                 if total_invoiced_free_qty < free_qty:
                     found_in_text = self._find_free_reward_in_text(invoice_text, free_prod_name)
                     if found_in_text > 0:
@@ -997,7 +1141,9 @@ Return ONLY valid JSON matching this schema:
         # Identify extra items present on invoice but absent in order
         unmatched_invoice_items = []
         for idx, inv_item in enumerate(line_items):
-            if idx not in matched_inv_indices:
+            if idx not in matched_inv_indices and idx not in cross_claimed_indices:
+                if self._is_tax_or_summary_row(inv_item):
+                    continue
                 qty = self._to_float(inv_item.get("qty") or inv_item.get("quantity"))
                 free_q = self._to_float(inv_item.get("free") or inv_item.get("sch") or inv_item.get("free_qty"))
                 taxable = self._to_float(inv_item.get("taxable_amt") or inv_item.get("taxable_amount"))
@@ -1013,6 +1159,9 @@ Return ONLY valid JSON matching this schema:
                     "net_amount": round(amt, 2)
                 })
         extra_items = unmatched_invoice_items
+
+        # Apply Variant Group Free Pooling (Issue 2)
+        self._apply_variant_group_free_pooling(items_list, reconciled_items)
 
         # Determine match_percentage, match_status and human-readable summary
         total_ordered_items = len(order_items)
@@ -1161,6 +1310,7 @@ Return ONLY valid JSON matching this schema:
         batch_expiry_map = {}
         batch_to_line = {}
         parsed_lines = parsed_invoice.get("line_items", []) if parsed_invoice else []
+        parsed_lines = [l for l in parsed_lines if not self._is_tax_or_summary_row(l)]
         for itm in parsed_lines:
             b_code = (itm.get("batch") or itm.get("batch_no") or "").strip().upper()
             exp_raw = itm.get("expiry") or itm.get("exp")
@@ -1272,20 +1422,42 @@ Return ONLY valid JSON matching this schema:
                 for pl in parsed_lines:
                     pl_q = self._to_float(pl.get("qty") or pl.get("quantity"))
                     pl_f = self._to_float(pl.get("free") or pl.get("sch") or pl.get("free_qty"))
-                    if pl_q == 0 and pl_f > 0 and self._match_product(matching_ord, pl):
-                        pl_b = (pl.get("batch") or pl.get("batch_no") or "N/A").strip()
-                        existing_vb = next((b for b in valid_batches if b["batch_no"] == pl_b), None) if pl_b != "N/A" else None
-                        if existing_vb:
-                            if int(pl_f) > 0 and existing_vb["free_quantity"] < int(pl_f):
-                                existing_vb["free_quantity"] += int(pl_f) if pl_f.is_integer() else pl_f
-                        else:
-                            valid_batches.append({
-                                "batch_no": pl_b,
-                                "quantity": 0,
-                                "free_quantity": int(pl_f) if pl_f.is_integer() else pl_f,
-                                "expiry_date": self._format_expiry_iso(pl.get("expiry") or pl.get("exp")),
-                                "match_status": "matched"
-                            })
+                    if pl_q == 0 and pl_f > 0:
+                        # Check if this bonus line belongs to a cross-product scheme of another ordered item
+                        is_cross_for_other = False
+                        for other_oi in order_items_list:
+                            other_f_qty = self._to_float(other_oi.get("free_qty") or other_oi.get("free") or other_oi.get("sch") or other_oi.get("bonus") or 0)
+                            other_f_name = other_oi.get("free_product_name")
+                            other_p_name = other_oi.get("product_name") or other_oi.get("name", "")
+                            c_op = re.sub(r'[^A-Z0-9]', '', str(other_p_name).upper())
+                            c_of = re.sub(r'[^A-Z0-9]', '', str(other_f_name).upper()) if other_f_name else ""
+                            if other_f_qty > 0 and c_of and c_of != c_op:
+                                target_check = {
+                                    "product_id": other_oi.get("free_product_id"),
+                                    "product_name": other_f_name,
+                                    "product_code": other_oi.get("free_product_code"),
+                                    "order_qty": other_f_qty
+                                }
+                                if self._match_product(target_check, pl):
+                                    is_cross_for_other = True
+                                    break
+                        if is_cross_for_other:
+                            continue
+
+                        if self._match_product(matching_ord, pl):
+                            pl_b = (pl.get("batch") or pl.get("batch_no") or "N/A").strip()
+                            existing_vb = next((b for b in valid_batches if b["batch_no"] == pl_b), None) if pl_b != "N/A" else None
+                            if existing_vb:
+                                if int(pl_f) > 0 and existing_vb["free_quantity"] < int(pl_f):
+                                    existing_vb["free_quantity"] += int(pl_f) if pl_f.is_integer() else pl_f
+                            else:
+                                valid_batches.append({
+                                    "batch_no": pl_b,
+                                    "quantity": 0,
+                                    "free_quantity": int(pl_f) if pl_f.is_integer() else pl_f,
+                                    "expiry_date": self._format_expiry_iso(pl.get("expiry") or pl.get("exp")),
+                                    "match_status": "matched"
+                                })
                 item["batches"] = valid_batches
 
             if item.get("order_item_id") is not None:
@@ -1490,6 +1662,8 @@ Return ONLY valid JSON matching this schema:
         # Clean extra_items to ensure no item in reconciled_items is also in extra_items
         clean_extra = []
         for ex in extra_items:
+            if self._is_tax_or_summary_row(ex):
+                continue
             b_no = (ex.get("batch_no") or "").strip().upper()
             if b_no and b_no in reconciled_batches:
                 continue
@@ -1545,11 +1719,30 @@ Return ONLY valid JSON matching this schema:
                             "match_status": "matched"
                         })
                 elif matching_r is not None and self._to_float(matching_r.get("invoiced_free_qty") or 0) < free_qty:
-                    # Check text for remarks/free column mentions
-                    found_free = self._find_free_reward_in_text(invoice_text if 'invoice_text' in locals() else "", free_prod_name)
-                    if found_free > 0:
-                        current_free = self._to_float(matching_r.get("invoiced_free_qty") or 0)
-                        matching_r["invoiced_free_qty"] = int(current_free + found_free) if (current_free + found_free).is_integer() else (current_free + found_free)
+                    # Check parsed_lines for Qty == 0, Free > 0 matching reward_target
+                    for pl in parsed_lines:
+                        pl_q = self._to_float(pl.get("qty") or pl.get("quantity"))
+                        pl_f = self._to_float(pl.get("free") or pl.get("sch") or pl.get("free_qty"))
+                        if (pl_q == 0 and pl_f > 0) or (pl_f == free_qty):
+                            if self._match_product(reward_target, pl):
+                                current_free = self._to_float(matching_r.get("invoiced_free_qty") or 0)
+                                matching_r["invoiced_free_qty"] = int(current_free + pl_f) if (current_free + pl_f).is_integer() else (current_free + pl_f)
+                                matching_r["free_product_name"] = free_prod_name
+                                matching_r.setdefault("batches", []).append({
+                                    "batch_no": pl.get("batch") or pl.get("batch_no") or "N/A",
+                                    "quantity": 0,
+                                    "free_quantity": int(pl_f) if pl_f.is_integer() else pl_f,
+                                    "expiry_date": self._format_expiry_iso(pl.get("expiry") or pl.get("exp")),
+                                    "match_status": "matched"
+                                })
+                                break
+
+                    if matching_r is not None and self._to_float(matching_r.get("invoiced_free_qty") or 0) < free_qty:
+                        found_free = self._find_free_reward_in_text(invoice_text if 'invoice_text' in locals() else "", free_prod_name)
+                        if found_free > 0:
+                            current_free = self._to_float(matching_r.get("invoiced_free_qty") or 0)
+                            matching_r["invoiced_free_qty"] = int(current_free + found_free) if (current_free + found_free).is_integer() else (current_free + found_free)
+                            matching_r["free_product_name"] = free_prod_name
 
         # Build items list matching exact expected schema
         items_list = []
@@ -1635,6 +1828,9 @@ Return ONLY valid JSON matching this schema:
                     "is_matched": False,
                     "discrepancies": [f"Product {prod_name} was not found on the invoice."]
                 })
+
+        # Apply Variant Group Free Pooling (Issue 2)
+        self._apply_variant_group_free_pooling(items_list, reconciled_items)
 
         # Enforce exact summary format and match_status consistency
         total_ordered_items = len(order_data.get("items", []))

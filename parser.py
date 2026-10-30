@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 
 class InvoiceParser:
     """
@@ -359,6 +359,77 @@ class InvoiceParser:
         return None
 
     @staticmethod
+    def is_tax_or_summary_row(item: Union[Dict[str, Any], str, List[str]]) -> bool:
+        """
+        Detects if a line item, description string, or table row represents a GST/tax summary breakdown
+        (e.g., 'GST 5.00% 30281.25', 'GST 12.00% 0.00', 'SGST', 'CGST', 'IGST', 'TOTAL')
+        or a non-product line with 0 rate, 0 qty, and 0 free.
+        """
+        if isinstance(item, list):
+            row_str = " ".join([str(c).strip() for c in item if c]).upper()
+            if not row_str:
+                return True
+            if re.search(r'\bGST\s*\d+(?:\.\d+)?%', row_str):
+                return True
+            if re.search(r'\b(?:SGST|CGST|IGST|UTGST)\b', row_str) and not any(kw in row_str for kw in ["CAP", "BELT", "ATOM", "BAND", "MASK", "MONITOR", "NEBULIZER"]):
+                return True
+            if any(row_str.startswith(k) for k in ["TOTAL", "GRAND TOTAL", "SUB TOTAL", "TAXABLE VALUE", "NET PAYABLE"]):
+                return True
+            return False
+
+        if isinstance(item, dict):
+            desc = str(item.get("description") or item.get("item_name") or item.get("product_name") or "").strip()
+            qty_val = item.get("qty") if item.get("qty") is not None else item.get("quantity")
+            free_val = item.get("free") if item.get("free") is not None else item.get("sch")
+            rate_val = item.get("rate") if item.get("rate") is not None else item.get("price")
+
+            def _has_positive_num(v):
+                if v is None: return False
+                s = re.sub(r'[^\d.]', '', str(v))
+                try:
+                    return float(s) > 0 if s else False
+                except ValueError:
+                    return False
+
+            has_qty = _has_positive_num(qty_val)
+            has_free = _has_positive_num(free_val)
+            has_rate = _has_positive_num(rate_val)
+            has_batch = str(item.get("batch") or item.get("batch_no") or "").upper() not in ["N/A", "", "NONE", "NULL"]
+            has_pcode = str(item.get("p_code") or item.get("product_code") or "").upper() not in ["N/A", "", "NONE", "NULL"]
+        else:
+            desc = str(item).strip()
+            has_qty = False
+            has_free = False
+            has_rate = False
+            has_batch = False
+            has_pcode = False
+
+        if not desc or desc.upper() in ["N/A", "NONE", "TOTAL", "SUB TOTAL", "GRAND TOTAL"]:
+            return True
+
+        d_upper = desc.upper()
+
+        if re.search(r'\bGST\s*\d+(?:\.\d+)?%', d_upper):
+            return True
+        if re.search(r'\b(?:SGST|CGST|IGST|UTGST)\b', d_upper):
+            return True
+        if re.search(r'\b(?:TAXABLE\s+VAL(?:UE)?|TOTAL\s+TAX|TAX\s+SUMMARY|GST\s+SUMMARY|TAX\s+BREAKUP)\b', d_upper):
+            return True
+        if re.search(r'\b(?:TOTAL|GRAND\s*TOTAL|SUB\s*TOTAL|NET\s*PAYABLE|ROUND\s*OFF|PAGE\s*TOTAL|TAXABLE\s*AMOUNT)\b', d_upper):
+            return True
+        if re.search(r'\b(?:AMOUNT\s+IN\s+WORDS|RUPEES|BANK\s+DETAILS|TERMS\s+&\s+CONDITIONS)\b', d_upper):
+            return True
+
+        if d_upper in ["GST", "TAX", "TOTALS", "SUMMARY", "TAXABLE", "NET TOTAL", "FINAL TOTAL"]:
+            return True
+
+        if isinstance(item, dict):
+            if not has_qty and not has_free and not has_rate and not has_batch and not has_pcode:
+                return True
+
+        return False
+
+    @staticmethod
     def parse_line_items(tables: List[List[List[str]]], mode: str = "admin") -> List[Dict[str, Any]]:
         """
         Extracts line items from tables, verifying that every product line item's
@@ -474,9 +545,11 @@ class InvoiceParser:
                 if not any(row):
                     continue
 
-                # Skip summary or total rows
+                # Skip summary or total rows or GST/tax breakdown rows
                 first_cells = " ".join([str(c).lower().strip() for c in row[:3] if c])
                 if any(k in first_cells for k in ["total", "grand total", "net payable", "sub total", "taxable value", "round off"]):
+                    continue
+                if InvoiceParser.is_tax_or_summary_row(row):
                     continue
 
                 # Skip repeated headers
@@ -553,7 +626,7 @@ class InvoiceParser:
                         if extracted_size and item.get("size", "N/A") in ["N/A", "", "None", None]:
                             item["size"] = extracted_size
 
-                        if item.get("description", "N/A") != "N/A":
+                        if item.get("description", "N/A") != "N/A" and not InvoiceParser.is_tax_or_summary_row(item):
                             extracted_items.append(item)
 
                 else:
@@ -637,7 +710,7 @@ class InvoiceParser:
                     if extracted_size and item.get("size", "N/A") in ["N/A", "", "None", None]:
                         item["size"] = extracted_size
 
-                    if item.get("description", "N/A") != "N/A":
+                    if item.get("description", "N/A") != "N/A" and not InvoiceParser.is_tax_or_summary_row(item):
                         extracted_items.append(item)
                         
         return extracted_items
